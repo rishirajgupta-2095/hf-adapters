@@ -213,6 +213,13 @@ MODEL_DTYPE_POLICIES: dict[str, ModelDTypePolicy] = {
     "google/embeddinggemma-300m": ModelDTypePolicy(dtype=torch.bfloat16),
     "ibm-granite/granite-4.0-1b-base": ModelDTypePolicy(cpu_dtype=torch.float32),
     "ibm-granite/granite-4.0-1b": ModelDTypePolicy(cpu_dtype=torch.float32),
+    # Pinned rather than inherited from config.dtype: swap_linears_to_fp8 builds
+    # FP8Linear's weight/weight_scale buffers as fp16 and fixes compute_dtype at
+    # swap time, but the device cast in _move_to_spyre_with_layout happens after
+    # and would rewrite those buffers to whatever dtype is resolved here. A bf16
+    # resolution therefore leaves scaled_mm emitting out_dtype=fp16 from a bf16
+    # activation -- a mismatch that only shows up deep in the compiled graph.
+    "ibm-granite/granite-3.3-8b-instruct-FP8": ModelDTypePolicy(dtype=torch.float16),
 }
 
 

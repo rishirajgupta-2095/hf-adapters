@@ -224,8 +224,59 @@ def replace_linear_with_fp8(
 #   plain fp16, still crashes, so this is not about fusion count and not about
 #   the other projections. Remove this exclusion once that codegen bug is
 #   fixed; nothing in this file needs to change when it is.
-DEFAULT_FP8_EXCLUDE = ("o_proj",)
+# DEFAULT_FP8_EXCLUDE = ("o_proj",)
+DEFAULT_FP8_EXCLUDE = ("o_proj", "down_proj")
 
+def fp8_status(model: nn.Module) -> dict:
+    """Report whether FP8 is actually in effect. Safe to call anywhere.
+
+    Reads module types and weight metadata only -- never runs a forward and
+    never touches ``FP8Linear.forward``. Instrumenting that method causes Dynamo
+    graph breaks that change which kernels Inductor generates, which once
+    produced a false "six projections work" result that stood for weeks. Call
+    this AFTER ``move_model_to_spyre`` and outside any compiled region.
+
+    Note what this does and does not prove. It confirms the swap happened and
+    survived the device move. It does NOT confirm that ``scaled_mm`` is in the
+    compiled graph -- if the blocks were compiled before the swap, these counts
+    look right while the graph still holds a plain fp16 matmul. For that proof
+    run with ``TORCH_COMPILE_DEBUG=1`` and grep ``fx_graph_readable.py`` for
+    ``scaled_mm``.
+
+    Returns ``n_fp8``, ``n_linear``, ``quantized_checkpoint`` (whether any
+    un-swapped E4M3 Linear remains -- nonzero means the swap missed some), the
+    sorted projection names in layer 0, and ``orientation_ok``.
+    """
+    n_fp8 = 0
+    n_linear = 0
+    n_unswapped_e4m3 = 0
+    orientation_ok = True
+
+    for _, m in model.named_modules():
+        if isinstance(m, FP8Linear):
+            n_fp8 += 1
+            # FP8Linear stores [in, out]; nn.Linear stores [out, in]. A mismatch
+            # means something re-wrote the buffer after the swap.
+            if tuple(m.weight.shape) != (m.in_features, m.out_features):
+                orientation_ok = False
+        elif isinstance(m, nn.Linear):
+            n_linear += 1
+            if m.weight.dtype == FP8_DTYPE:
+                n_unswapped_e4m3 += 1
+
+    names = sorted(
+        name.split(".")[-1]
+        for name, m in model.named_modules()
+        if isinstance(m, FP8Linear) and ".0." in f".{name}."
+    )
+
+    return {
+        "n_fp8": n_fp8,
+        "n_linear": n_linear,
+        "n_unswapped_e4m3": n_unswapped_e4m3,
+        "layer0_fp8_projections": names,
+        "orientation_ok": orientation_ok,
+    }
 
 def _dequantize_checkpoint_weight(linear: nn.Module) -> torch.Tensor:
     """Reconstruct the fp16 weight from a compressed-tensors E4M3 Linear.

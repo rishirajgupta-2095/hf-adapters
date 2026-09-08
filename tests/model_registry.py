@@ -78,6 +78,12 @@ CAUSAL_LM_MODELS = {
         "adapter": "hf_granite.py",
         "size": "2b",
     },
+        "granite8b_fp8": {
+        "name": "Granite 3.3 8B FP8",
+        "path": "ibm-granite/granite-3.3-8b-instruct-FP8",
+        "adapter": "hf_granite.py",
+        "size": "8b",
+    },
     # hf_granitemoehybrid.py
     "granite4": {
         "name": "Granite 4.0 1B",
@@ -723,15 +729,31 @@ def _non_blocking(models: dict[str, dict], keys: tuple[str, ...]) -> dict[str, s
 # The tables are per-harness rather than one merged dict because a path can name
 # two different adapters — google/gemma-4-12B-it is both ``gemma4_google`` (causal)
 # and ``gemma4_mm`` (VLM).
+
+# NON_BLOCKING_CAUSAL_MODELS: dict[str, str] = _non_blocking(
+#     CAUSAL_LM_MODELS,
+#     (
+#         "gemma4_google",  # gemma4 responds poorly to prompt without template
+#         "gemma4_base",
+#         "smollm3",
+#     ),
+# )
 NON_BLOCKING_CAUSAL_MODELS: dict[str, str] = _non_blocking(
     CAUSAL_LM_MODELS,
     (
         "gemma4_google",  # gemma4 responds poorly to prompt without template
         "gemma4_base",
         "smollm3",
+        # FP8 runs only 5 of 7 projections; o_proj and down_proj are excluded by
+        # two open torch-spyre codegen bugs, not by anything this repo can fix.
+        # Held to the SAME bar as every other model (exact top-1 agreement with
+        # the HF CPU reference at every step) rather than given an FP8 tolerance:
+        # a changed greedy token is a difference users would see, so it should
+        # show in the report. Non-blocking is what keeps that honesty from
+        # gating CI while the exclusions stand.
+        "granite8b_fp8",
     ),
 )
-
 NON_BLOCKING_VISION_MODELS: dict[str, str] = _non_blocking(
     VISION_MODELS,
     ("gemma4_mm",),

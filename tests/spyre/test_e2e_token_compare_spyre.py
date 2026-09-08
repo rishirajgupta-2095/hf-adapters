@@ -250,6 +250,40 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
         )
 
 
+# def _run_model_test(model_path: str, num_decode: int = 4) -> list[dict[str, Any]]:
+#     """Full comparison for one model. Returns the list of comparison rows."""
+#     from transformers import AutoTokenizer
+
+#     adapter = resolve_adapter_module_for_test(model_path)
+
+#     print(f"\n{'=' * 70}")
+#     print(f"  {model_path}")
+#     print(f"{'=' * 70}")
+
+#     tokenizer = AutoTokenizer.from_pretrained(model_path)
+#     model = load_ref_model(model_path=model_path, adapter_mod=adapter)
+
+#     prompt = "The capital of France is"
+#     encoded = tokenizer(prompt, return_tensors="pt")
+#     input_ids = encoded["input_ids"]
+#     print(f"  Prompt: {prompt!r} ({input_ids.shape[1]} tokens)")
+
+#     print("  Running HF reference on CPU ...")
+#     hf_results = hf_greedy_steps(model, input_ids, num_decode=num_decode)
+
+#     # Use bf16/fp16 dtype, requested by the registry or based on the model config.
+#     # (Spyre does not support float32, so float32 entries will use fp16.)
+#     spyre_dtype = dtype_for_model_path(model_path, target_device="spyre")
+#     move_model_to_spyre(model=model, module=adapter, dtype=spyre_dtype)
+#     print("  Running adapter on Spyre ...")
+#     adapter_results = adapter_greedy_steps(
+#         adapter._run_forward,
+#         model,
+#         input_ids,
+#         num_decode=num_decode,
+#     )
+
+#     return _compare_results(hf_results, adapter_results, tokenizer, model_path)
 def _run_model_test(model_path: str, num_decode: int = 4) -> list[dict[str, Any]]:
     """Full comparison for one model. Returns the list of comparison rows."""
     from transformers import AutoTokenizer
@@ -271,10 +305,46 @@ def _run_model_test(model_path: str, num_decode: int = 4) -> list[dict[str, Any]
     print("  Running HF reference on CPU ...")
     hf_results = hf_greedy_steps(model, input_ids, num_decode=num_decode)
 
+    # Reload before the Spyre half. compressed-tensors keeps a quantized
+    # checkpoint's weights in E4M3 until the first forward and decompresses them
+    # IN PLACE at that point -- and the reference above is that first forward.
+    # swap_linears_to_fp8 detects work by looking for E4M3 Linears, so reusing
+    # this object makes the FP8 swap a silent no-op: the Spyre side would run a
+    # dequantized fp16 model while the test reports on "FP8". Costs one extra
+    # load; `del` first so peak memory stays at roughly one copy.
+    del model
+    model = load_ref_model(model_path=model_path, adapter_mod=adapter)
+
     # Use bf16/fp16 dtype, requested by the registry or based on the model config.
     # (Spyre does not support float32, so float32 entries will use fp16.)
     spyre_dtype = dtype_for_model_path(model_path, target_device="spyre")
     move_model_to_spyre(model=model, module=adapter, dtype=spyre_dtype)
+
+    # Report and guard FP8 state. A quantized checkpoint whose swap silently
+    # no-ops runs as plain dequantized fp16 while the report still says "FP8" --
+    # that happened, and only the absence of one log line gave it away. Assert
+    # rather than print so it can never pass unnoticed again.
+    from hf_adapters.fp8_linear import fp8_status
+
+    status = fp8_status(model)
+    if status["n_fp8"] or getattr(model.config, "quantization_config", None):
+        print(f"  FP8 status: {status}")
+    if getattr(model.config, "quantization_config", None):
+        assert status["n_fp8"] > 0, (
+            f"{model_path} is a quantized checkpoint but no FP8Linear survived "
+            f"to the device -- the swap was a no-op, so this run measures a "
+            f"dequantized fp16 model, not FP8. status={status}"
+        )
+        assert status["n_unswapped_e4m3"] == 0, (
+            f"{status['n_unswapped_e4m3']} E4M3 nn.Linear left un-swapped; a "
+            f"later .to(dtype) casts those bytes WITHOUT weight_scale, which is "
+            f"silently ~448x wrong. status={status}"
+        )
+        assert status["orientation_ok"], (
+            f"FP8Linear weight is not [in_features, out_features]; something "
+            f"re-wrote the buffer after the swap. status={status}"
+        )
+
     print("  Running adapter on Spyre ...")
     adapter_results = adapter_greedy_steps(
         adapter._run_forward,
