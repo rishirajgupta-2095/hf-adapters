@@ -128,7 +128,12 @@ class FP8Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.compute_dtype = dtype
-
+        # False: ``weight`` is fp16 and forward re-quantizes it on every call.
+        # True:  ``weight`` is already E4M3 in QFP8WT arrangement and forward
+        #        feeds it to scaled_mm directly -- see prequantize_fp8_weights.
+        # A plain bool, constant after prepare, so Dynamo specializes on it
+        # without a graph break.
+        self.prequantized = False
         self.register_buffer(
             "weight", torch.empty(in_features, out_features, dtype=dtype)
         )
@@ -155,9 +160,18 @@ class FP8Linear(nn.Module):
             x_scale = (
                 x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)
             ).clamp(min=SCALE_EPS).clone()             # (*batch, 1), clean layout
-
-            wq = torch.ops.spyre.quantize_weight_fp8_with_scale(
-                self.weight, self.weight_scale
+            # When prequantized, `weight` IS the QFP8WT E4M3 tensor and enters
+            # the graph as an input rather than being produced inside it. That
+            # is the whole point -- it removes one op per projection per forward
+            # and lets the fp16 copy be freed -- but it also means the layout
+            # pass sees an opaque input arrangement rather than a chain it built
+            # itself, which is exactly where a restickify can appear.
+            wq = (
+                self.weight
+                if self.prequantized
+                else torch.ops.spyre.quantize_weight_fp8_with_scale(
+                    self.weight, self.weight_scale
+                )
             )
             # Quantize at full rank so xq retains the input's natural shape,
             # then flatten only xq for scaled_mm — exactly the fms-model-
@@ -227,6 +241,64 @@ def replace_linear_with_fp8(
 # DEFAULT_FP8_EXCLUDE = ("o_proj",)
 DEFAULT_FP8_EXCLUDE = ("o_proj", "down_proj")
 
+def prequantize_fp8_weights(model: nn.Module) -> int:
+    """Quantize every ``FP8Linear`` weight to E4M3/QFP8WT once, in place.
+
+    Call AFTER the device move and after any ``_spyre_cpu_submodules`` restore,
+    but BEFORE the first forward. ``torch.compile`` is lazy, so the blocks are
+    wrapped but not yet traced at that point -- they get traced against the
+    already-quantized weight, with ``prequantized`` True.
+
+    Without this, ``forward`` re-runs ``quantize_weight_fp8_with_scale`` on every
+    call for a weight that never changes: 200 redundant ops per token at the
+    current 5/7 projection set, and the fp16 copy stays resident (~15.9 GB rather
+    than ~10.7 GB for Granite 3.3 8B). Rebinding the buffer here drops the last
+    reference to the fp16 tensor, which is where the memory actually comes back.
+
+    REQUIRES a torch-spyre whose ``quantize_weight_fp8_with_scale`` has a real
+    eager implementation. On stock builds it is a tracer stub with a literal
+    ``pass`` body that returns **None** outside a compiled region -- assigning
+    that to ``weight`` would produce a model that fails much later, somewhere
+    unrecognizable, so the result is checked rather than trusted.
+
+    Skips modules whose weight is not on Spyre (a QFP8WT arrangement is a device
+    layout and cannot exist on CPU), which also makes this safe to call from
+    CPU-only tests. Idempotent. Returns the number of modules quantized.
+    """
+    n = 0
+    for name, m in model.named_modules():
+        if not isinstance(m, FP8Linear) or m.prequantized:
+            continue
+        if m.weight.device.type != "spyre":
+            continue
+
+        wq = torch.ops.spyre.quantize_weight_fp8_with_scale(m.weight, m.weight_scale)
+
+        if wq is None or not isinstance(wq, torch.Tensor):
+            raise RuntimeError(
+                f"quantize_weight_fp8_with_scale returned {type(wq).__name__} for "
+                f"{name!r}. This torch-spyre has only the tracer stub (a literal "
+                f"`pass` body), which is real solely inside a compiled region. "
+                f"Prequantization needs a build with the eager implementation; "
+                f"without it, leave FP8Linear.prequantized False and let forward "
+                f"quantize inside the graph."
+            )
+        if wq.dtype != FP8_DTYPE:
+            raise RuntimeError(
+                f"expected {FP8_DTYPE} from quantize_weight_fp8_with_scale for "
+                f"{name!r}, got {wq.dtype}"
+            )
+
+        m.weight = wq  # rebind: drops the last reference to the fp16 buffer
+        m.prequantized = True
+        n += 1
+
+    if n:
+        print(f"FP8: {n} weight(s) prequantized to E4M3/QFP8WT at load time")
+    return n
+
+
+
 def fp8_status(model: nn.Module) -> dict:
     """Report whether FP8 is actually in effect. Safe to call anywhere.
 
@@ -250,13 +322,18 @@ def fp8_status(model: nn.Module) -> dict:
     n_fp8 = 0
     n_linear = 0
     n_unswapped_e4m3 = 0
+    n_prequantized = 0
     orientation_ok = True
 
     for _, m in model.named_modules():
         if isinstance(m, FP8Linear):
             n_fp8 += 1
+            if m.prequantized:
+                n_prequantized += 1
             # FP8Linear stores [in, out]; nn.Linear stores [out, in]. A mismatch
-            # means something re-wrote the buffer after the swap.
+            # means something re-wrote the buffer after the swap. Checked for
+            # prequantized modules too: QFP8WT changes the physical arrangement
+            # but should leave the logical shape alone.
             if tuple(m.weight.shape) != (m.in_features, m.out_features):
                 orientation_ok = False
         elif isinstance(m, nn.Linear):
@@ -274,6 +351,7 @@ def fp8_status(model: nn.Module) -> dict:
         "n_fp8": n_fp8,
         "n_linear": n_linear,
         "n_unswapped_e4m3": n_unswapped_e4m3,
+        "n_prequantized": n_prequantized,
         "layer0_fp8_projections": names,
         "orientation_ok": orientation_ok,
     }

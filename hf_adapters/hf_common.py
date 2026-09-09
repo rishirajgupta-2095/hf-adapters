@@ -1425,14 +1425,30 @@ def load_model_common(
     return model
 
 
+# def move_model_to_spyre(model, module, dtype: torch.dtype) -> None:
+#     untie_embedding_and_lm_head(model)
+#     module.prepare_for_spyre(model)
+#     _move_to_spyre_with_layout(model, dtype)
+#     for submod_name in getattr(model, "_spyre_cpu_submodules", []):
+#         model.get_submodule(submod_name).to("cpu")
+#     print("Model on Spyre ready.")
 def move_model_to_spyre(model, module, dtype: torch.dtype) -> None:
+    from hf_adapters.fp8_linear import prequantize_fp8_weights
+
     untie_embedding_and_lm_head(model)
     module.prepare_for_spyre(model)
     _move_to_spyre_with_layout(model, dtype)
     for submod_name in getattr(model, "_spyre_cpu_submodules", []):
         model.get_submodule(submod_name).to("cpu")
-    print("Model on Spyre ready.")
 
+    # A no-op unless the model holds FP8Linear modules. Runs LAST so device
+    # placement is final: the loop above moves selected submodules back to CPU,
+    # and a QFP8WT arrangement is a device layout that cannot follow them there.
+    # Safe before the first forward because torch.compile is lazy -- the blocks
+    # are wrapped but not yet traced, so they trace against the quantized weight.
+    prequantize_fp8_weights(model)
+
+    print("Model on Spyre ready.")
 
 # ---------------------------------------------------------------------------
 # Generation-parameter resolution
