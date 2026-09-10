@@ -323,6 +323,7 @@ def fp8_status(model: nn.Module) -> dict:
     n_linear = 0
     n_unswapped_e4m3 = 0
     n_prequantized = 0
+    n_weight_fp8 = 0
     orientation_ok = True
 
     for _, m in model.named_modules():
@@ -330,6 +331,12 @@ def fp8_status(model: nn.Module) -> dict:
             n_fp8 += 1
             if m.prequantized:
                 n_prequantized += 1
+            # Must track prequantized exactly: a prequantized module holds E4M3,
+            # a non-prequantized one holds fp16. A count mismatch means the
+            # buffer rebind failed, or a weight was quantized without the flag
+            # being set -- either way forward takes the wrong branch.
+            if m.weight.dtype == FP8_DTYPE:
+                n_weight_fp8 += 1
             # FP8Linear stores [in, out]; nn.Linear stores [out, in]. A mismatch
             # means something re-wrote the buffer after the swap. Checked for
             # prequantized modules too: QFP8WT changes the physical arrangement
@@ -352,6 +359,7 @@ def fp8_status(model: nn.Module) -> dict:
         "n_linear": n_linear,
         "n_unswapped_e4m3": n_unswapped_e4m3,
         "n_prequantized": n_prequantized,
+        "n_weight_fp8": n_weight_fp8,
         "layer0_fp8_projections": names,
         "orientation_ok": orientation_ok,
     }

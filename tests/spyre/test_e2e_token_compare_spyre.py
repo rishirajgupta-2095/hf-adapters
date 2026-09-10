@@ -344,6 +344,15 @@ def _run_model_test(model_path: str, num_decode: int = 4) -> list[dict[str, Any]
             f"FP8Linear weight is not [in_features, out_features]; something "
             f"re-wrote the buffer after the swap. status={status}"
         )
+        # Prequantized modules hold E4M3; the rest hold fp16. These counts must
+        # match exactly. If they diverge, forward takes the wrong branch: a
+        # prequantized-but-fp16 weight goes to scaled_mm unquantized, and an
+        # E4M3-but-not-flagged weight gets quantized a second time.
+        assert status["n_prequantized"] == status["n_weight_fp8"], (
+            f"prequantized flag and weight dtype disagree: "
+            f"{status['n_prequantized']} flagged vs {status['n_weight_fp8']} "
+            f"actually E4M3. status={status}"
+        )
 
     print("  Running adapter on Spyre ...")
     adapter_results = adapter_greedy_steps(
