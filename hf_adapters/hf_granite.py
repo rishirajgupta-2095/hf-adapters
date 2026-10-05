@@ -103,6 +103,14 @@ def _fp16_rmsnorm_forward(self, h):
     return self.weight * (h * torch.rsqrt(variance + self.variance_epsilon))
 
 
+def _fp16_rmsnorm_forward(self, h):
+    """RMSNorm with the variance reduction kept in fp16 on Spyre."""
+    if h.device.type != "spyre":
+        return type(self).forward(self, h)
+    variance = (h * h).mean(-1, keepdim=True)
+    return self.weight * (h * torch.rsqrt(variance + self.variance_epsilon))
+
+
 def prepare_for_spyre(model):
     """Apply Spyre adaptations to Granite 3.3 model in-place."""
     backbone = get_backbone(model)
