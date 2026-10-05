@@ -60,18 +60,14 @@ class FP8Linear(nn.Module):
         out_shape = (*x.shape[:-1], self.out_features)
 
         if x.device.type == "spyre":
-            # Fused per-token scale (torch-spyre#3457). clone() gives x_scale a
-            # fresh layout; inherited rank-reducing ancestry otherwise breaks
-            # the multi-arg rescale in layout propagation.
+            # Work on a contiguous copy so that all FP8 ops — scale, quantize,
+            # scaled_mm — see a layout with no non-contiguous ancestry (e.g.
+            # from attn_out.transpose+reshape feeding o_proj). Without this the
+            # restickify pass sees Mod(d0, head_dim) instead of Mod(d0, 128) on
+            # the scaled_mm input. clone() doubles as the contiguity guarantee
+            # and gives x_scale a fresh layout node in the graph.
+            x = x.contiguous()
             x_scale = torch.ops.spyre.quantscalepertokenfp8(x, FP8_MAX).clone()
-            # clone() gives x_scale a fresh layout; inherited rank-reducing
-            # ancestry (e.g. o_proj's input) otherwise breaks the multi-arg
-            # rescale in layout propagation.
-            # x_scale = (
-            #     (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX))
-            #     .clamp(min=SCALE_EPS)
-            #     .clone()
-            # )
             wq = (
                 self.weight
                 if self.prequantized
