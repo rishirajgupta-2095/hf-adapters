@@ -239,6 +239,7 @@ MODEL_DTYPE_POLICIES: dict[str, ModelDTypePolicy] = {
     "google/embeddinggemma-300m": ModelDTypePolicy(dtype=torch.bfloat16),
     "ibm-granite/granite-4.0-1b-base": ModelDTypePolicy(cpu_dtype=torch.float32),
     "ibm-granite/granite-4.0-1b": ModelDTypePolicy(cpu_dtype=torch.float32),
+    "ibm-granite/granite-3.3-8b-instruct-FP8": ModelDTypePolicy(dtype=torch.float16),
 }
 
 

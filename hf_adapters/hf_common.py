@@ -412,6 +412,9 @@ def apply_rope_matmul(x, selected_freqs):
 def kv_cache_update(k, v, key_cache, value_cache, cache_index):
     """Write K/V into the KV cache by indirect scatter along the cache-position dim.
 
+    Supports both standard floating point caches (fp16/bf16) and FP8 KV caches
+    (torch.float8_e4m3fn).
+
     Args:
         k, v: ``[B, n_kv, n, head_dim]`` — the projections for ``n`` positions.
         key_cache, value_cache: ``[B, n_kv, max_cache_len, head_dim]``, allocated
@@ -445,8 +448,12 @@ def kv_cache_update(k, v, key_cache, value_cache, cache_index):
     in ``k``/``v``. Callers decode one token per step, so ``k``/``v`` carry exactly
     the positions to store — there is no separate source-gather step.
     """
-    key_cache.index_copy_(2, cache_index, k)
-    value_cache.index_copy_(2, cache_index, v)
+    # If the cache is FP8, cast/quantize incoming k, v to the cache dtype
+    k_to_store = k.to(key_cache.dtype) if key_cache.dtype != k.dtype else k
+    v_to_store = v.to(value_cache.dtype) if value_cache.dtype != v.dtype else v
+
+    key_cache.index_copy_(2, cache_index, k_to_store)
+    value_cache.index_copy_(2, cache_index, v_to_store)
     return key_cache, value_cache
 
 
@@ -2467,10 +2474,12 @@ class StandardGQAAttention(nn.Module):
 
     def attn_core(self, q, key_cache, value_cache, attn_mask):
         bsz, _, seq_len, _ = q.shape
+        k_in = key_cache.to(q.dtype) if key_cache.dtype != q.dtype else key_cache
+        v_in = value_cache.to(q.dtype) if value_cache.dtype != q.dtype else value_cache
         attn_out = F.scaled_dot_product_attention(
             q,
-            key_cache,
-            value_cache,
+            k_in,
+            v_in,
             attn_mask=attn_mask,
             dropout_p=0.0,
             scale=self.scaling,
