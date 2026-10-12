@@ -36,6 +36,8 @@ from sympy import factorint
 from transformers import GenerationConfig
 from transformers.generation import GenerateDecoderOnlyOutput
 
+from . import fp8_kv
+
 # Rank-aware device for multi-Spyre (tensor-parallel) runs. torchrun sets
 # LOCAL_RANK before this module is imported, so each process binds to its local
 # AIU. Single-device runs get spyre:0. The conftest CPU-patch overwrites this to
@@ -1324,7 +1326,14 @@ def _prefill_cache_inputs(caches, prefill_kv_len, chunked_prefill):
     ]
 
 
-def _cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, head_dim, dtype):
+def _cache_position_first_stl(
+    batch_size,
+    num_kv_heads,
+    max_cache_len,
+    head_dim,
+    dtype,
+    element_arrangement=None,
+):
     """Device layout for a ``[B, n_kv, L, hd]`` cache with ``L`` OUTERMOST on device.
 
     Indirect access (gather/scatter) requires the indexed dimension — here the
@@ -1359,7 +1368,7 @@ def _cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, head_dim,
     shape = [batch_size, num_kv_heads, max_cache_len, head_dim]
     eps = SpyreTensorLayout(shape, dtype).elems_per_stick()
     sticks = (head_dim + eps - 1) // eps
-    return SpyreTensorLayout(
+    stl = SpyreTensorLayout(
         device_size=[max_cache_len, num_kv_heads, sticks, batch_size, eps],
         stride_map=[
             head_dim,  # L
@@ -1370,6 +1379,13 @@ def _cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, head_dim,
         ],
         device_dtype=get_device_dtype(dtype),
     )
+    # An FP8 key cache read as a matmul ``mat2`` is QFP8WT-arranged, so the
+    # read needs no restickify (FP8 KV cache, ``fp8_kv.py``). The device dims
+    # above are unchanged: the arrangement describes how elements sit within a
+    # stick, and at ``head_dim=128`` one FP8 stick holds exactly one row.
+    if element_arrangement is not None:
+        stl = stl.with_element_arrangement(element_arrangement)
+    return stl
 
 
 def make_cache_index(start, length, device=None):
@@ -1390,7 +1406,13 @@ def make_cache_index(start, length, device=None):
 
 
 def allocate_kv_cache_tensor(
-    batch_size, num_kv_heads, max_cache_len, head_dim, dtype, device=None
+    batch_size,
+    num_kv_heads,
+    max_cache_len,
+    head_dim,
+    dtype,
+    device=None,
+    element_arrangement=None,
 ):
     """Allocate one zeroed KV tensor with a scatter-ready device layout."""
     if device is None:
@@ -1398,7 +1420,12 @@ def allocate_kv_cache_tensor(
     on_spyre = torch.device(device).type == "spyre"
     stl = (
         _cache_position_first_stl(
-            batch_size, num_kv_heads, max_cache_len, head_dim, dtype
+            batch_size,
+            num_kv_heads,
+            max_cache_len,
+            head_dim,
+            dtype,
+            element_arrangement=element_arrangement,
         )
         if on_spyre
         else None
@@ -1438,6 +1465,10 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
     if allocator := getattr(model, "_spyre_cache_allocator", None):
         return allocator(model, batch_size, max_cache_len, dtype, device)
     shapes = kv_cache_shapes(model)
+    if getattr(model, "_spyre_fp8_kv_cache", False):
+        return _allocate_fp8_kv_caches(
+            model, shapes, batch_size, max_cache_len, dtype, device
+        )
     key_caches = [
         allocate_kv_cache_tensor(batch_size, n_kv, max_cache_len, hd, dtype, device)
         for (n_kv, hd, _vhd) in shapes
@@ -1446,6 +1477,46 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
         allocate_kv_cache_tensor(batch_size, n_kv, max_cache_len, vhd, dtype, device)
         for (n_kv, _hd, vhd) in shapes
     ]
+    return key_caches, value_caches
+
+
+def _allocate_fp8_kv_caches(model, shapes, batch_size, max_cache_len, dtype, device):
+    """KV caches with the KEY cache in E4M3/QFP8WT, plus per-layer scale caches.
+
+    Only K goes FP8: it is the operand of the ``Q · Kᵀ`` matmul we move onto the
+    FP8 engine. V stays ``dtype`` because ``A · V`` still runs in fp16 (see
+    ``fp8_kv``). The scale caches ride on the attention modules rather than the
+    block signature — see ``fp8_kv.attach_k_scale_caches``.
+    """
+    from . import fp8_kv
+
+    key_caches = [
+        allocate_kv_cache_tensor(
+            batch_size,
+            n_kv,
+            max_cache_len,
+            hd,
+            fp8_kv.FP8_DTYPE,
+            device,
+            element_arrangement=fp8_kv.k_cache_arrangement(),
+        )
+        for (n_kv, hd, _vhd) in shapes
+    ]
+    value_caches = [
+        allocate_kv_cache_tensor(batch_size, n_kv, max_cache_len, vhd, dtype, device)
+        for (n_kv, _hd, vhd) in shapes
+    ]
+    scale_caches = [
+        fp8_kv.allocate_k_scale_cache(batch_size, n_kv, max_cache_len, dtype, device)
+        for (n_kv, _hd, _vhd) in shapes
+    ]
+    n_attached = fp8_kv.attach_k_scale_caches(model, scale_caches)
+    if n_attached != len(scale_caches):
+        raise RuntimeError(
+            f"FP8 KV cache: wired {n_attached} scale cache(s) to attention modules "
+            f"but allocated {len(scale_caches)} — the model's blocks do not expose "
+            "the expected `self_attn` with `pre_attn`"
+        )
     return key_caches, value_caches
 
 
@@ -2438,6 +2509,11 @@ class StandardGQAAttention(nn.Module):
         self.head_dim = attn.head_dim
         self.v_head_dim = getattr(attn, "v_head_dim", attn.head_dim)
         self.scaling = attn.scaling
+        # Set per request by fp8_kv.attach_k_scale_caches when the FP8 key-cache
+        # path is on. A plain attribute (None or a tensor), so Dynamo specializes
+        # on which branch runs instead of breaking the graph.
+        self._k_scale_cache = None
+        self._spyre_fp8_kv_cache = False
 
     def pre_attn(
         self,
@@ -2467,28 +2543,51 @@ class StandardGQAAttention(nn.Module):
         q = apply_rope_matmul(q, selected_freqs)
         k = apply_rope_matmul(k, selected_freqs)
 
-        key_cache, value_cache = kv_cache_update(
-            k,
-            v,
-            key_cache,
-            value_cache,
-            cache_index,
-        )
+        if self._k_scale_cache is not None:
+            # FP8 key cache: quantize K once here, on the way in, so every later
+            # read is a plain load. See fp8_kv.
+            key_cache, value_cache = fp8_kv.store_fp8_kv(
+                k, v, key_cache, value_cache, self._k_scale_cache, cache_index
+            )
+        else:
+            key_cache, value_cache = kv_cache_update(
+                k,
+                v,
+                key_cache,
+                value_cache,
+                cache_index,
+            )
         return q, key_cache, value_cache
 
     def attn_core(self, q, key_cache, value_cache, attn_mask):
         bsz, _, seq_len, _ = q.shape
-        k_in = key_cache.to(q.dtype) if key_cache.dtype != q.dtype else key_cache
-        v_in = value_cache.to(q.dtype) if value_cache.dtype != q.dtype else value_cache
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            k_in,
-            v_in,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            scale=self.scaling,
-            enable_gqa=True,
-        )
+        if self._k_scale_cache is not None:
+            # FP8 key cache: Q·Kᵀ on the FP8 engine, the rest fp16. Same
+            # [B, n_q, L, Dh] result as SDPA, so the tail below is shared.
+            attn_out = fp8_kv.fp8_gqa_attention(
+                q,
+                key_cache,
+                self._k_scale_cache,
+                value_cache,
+                attn_mask,
+                self.scaling,
+            )
+        else:
+            k_in = key_cache.to(q.dtype) if key_cache.dtype != q.dtype else key_cache
+            v_in = (
+                value_cache.to(q.dtype)
+                if value_cache.dtype != q.dtype
+                else value_cache
+            )
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                k_in,
+                v_in,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                scale=self.scaling,
+                enable_gqa=True,
+            )
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
 
