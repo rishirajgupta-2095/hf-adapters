@@ -1317,7 +1317,9 @@ def _prefill_cache_inputs(caches, prefill_kv_len, chunked_prefill):
     ]
 
 
-def _cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, head_dim, dtype):
+def _cache_position_first_stl(
+    batch_size, num_kv_heads, max_cache_len, head_dim, dtype, element_arrangement=None
+):
     """Device layout for a ``[B, n_kv, L, hd]`` cache with ``L`` OUTERMOST on device.
 
     Indirect access (gather/scatter) requires the indexed dimension — here the
@@ -1352,7 +1354,7 @@ def _cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, head_dim,
     shape = [batch_size, num_kv_heads, max_cache_len, head_dim]
     eps = SpyreTensorLayout(shape, dtype).elems_per_stick()
     sticks = (head_dim + eps - 1) // eps
-    return SpyreTensorLayout(
+    stl = SpyreTensorLayout(
         device_size=[max_cache_len, num_kv_heads, sticks, batch_size, eps],
         stride_map=[
             head_dim,  # L
@@ -1363,6 +1365,11 @@ def _cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, head_dim,
         ],
         device_dtype=get_device_dtype(dtype),
     )
+    # FP8 KV cache (fp8_kv): tag the cache with the arrangement its quantize op
+    # produces, QFP8WT for K and QFP8CH for V. The device dims are unchanged.
+    if element_arrangement is not None:
+        stl = stl.with_element_arrangement(element_arrangement)
+    return stl
 
 
 def make_cache_index(start, length, device=None):
@@ -1383,7 +1390,13 @@ def make_cache_index(start, length, device=None):
 
 
 def allocate_kv_cache_tensor(
-    batch_size, num_kv_heads, max_cache_len, head_dim, dtype, device=None
+    batch_size,
+    num_kv_heads,
+    max_cache_len,
+    head_dim,
+    dtype,
+    device=None,
+    element_arrangement=None,
 ):
     """Allocate one zeroed KV tensor with a scatter-ready device layout."""
     if device is None:
@@ -1391,7 +1404,12 @@ def allocate_kv_cache_tensor(
     on_spyre = torch.device(device).type == "spyre"
     stl = (
         _cache_position_first_stl(
-            batch_size, num_kv_heads, max_cache_len, head_dim, dtype
+            batch_size,
+            num_kv_heads,
+            max_cache_len,
+            head_dim,
+            dtype,
+            element_arrangement=element_arrangement,
         )
         if on_spyre
         else None
@@ -1431,6 +1449,14 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
     if allocator := getattr(model, "_spyre_cache_allocator", None):
         return allocator(model, batch_size, max_cache_len, dtype, device)
     shapes = kv_cache_shapes(model)
+    if getattr(model, "_spyre_fp8_kv_cache", False):
+        # Imported here, not at module load: hf_common must not import from its
+        # own package (hf_adapters/__init__ imports adapters that import it).
+        from . import fp8_kv
+
+        return fp8_kv.allocate_fp8_kv_caches(
+            model, shapes, batch_size, max_cache_len, device
+        )
     key_caches = [
         allocate_kv_cache_tensor(batch_size, n_kv, max_cache_len, hd, dtype, device)
         for (n_kv, hd, _vhd) in shapes
@@ -2431,6 +2457,15 @@ class StandardGQAAttention(nn.Module):
         self.head_dim = attn.head_dim
         self.v_head_dim = getattr(attn, "v_head_dim", attn.head_dim)
         self.scaling = attn.scaling
+        # FP8 KV cache (fp8_kv): set per request by fp8_kv.attach_fp8_kv. The two
+        # functions are injected rather than imported because hf_common must not
+        # import from its own package. All plain attributes, so Dynamo
+        # specializes on which path runs instead of breaking the graph.
+        self._fp8_store = None
+        self._fp8_attention = None
+        self._k_scale = None
+        self._v_scale = None
+        self._kv_scales_set = False
 
     def pre_attn(
         self,
@@ -2460,26 +2495,40 @@ class StandardGQAAttention(nn.Module):
         q = apply_rope_matmul(q, selected_freqs)
         k = apply_rope_matmul(k, selected_freqs)
 
-        key_cache, value_cache = kv_cache_update(
-            k,
-            v,
-            key_cache,
-            value_cache,
-            cache_index,
-        )
+        if self._fp8_store is not None:
+            # FP8 KV cache: K and V quantized once, here, so every later read
+            # is a plain load.
+            key_cache, value_cache = self._fp8_store(
+                self, k, v, key_cache, value_cache, cache_index
+            )
+        else:
+            key_cache, value_cache = kv_cache_update(
+                k,
+                v,
+                key_cache,
+                value_cache,
+                cache_index,
+            )
         return q, key_cache, value_cache
 
     def attn_core(self, q, key_cache, value_cache, attn_mask):
         bsz, _, seq_len, _ = q.shape
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            key_cache,
-            value_cache,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            scale=self.scaling,
-            enable_gqa=True,
-        )
+        if self._fp8_attention is not None:
+            # Q·Kᵀ in FP8, softmax and A·V in fp16. Same [B, n_q, L, Dh] result
+            # as SDPA, so the o_proj tail below is shared.
+            attn_out = self._fp8_attention(
+                self, q, key_cache, value_cache, attn_mask
+            )
+        else:
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                key_cache,
+                value_cache,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                scale=self.scaling,
+                enable_gqa=True,
+            )
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
 
@@ -2560,6 +2609,11 @@ class StandardGQABlock(nn.Module):
         q, key_cache, value_cache = self._pre_attn(
             hidden_states, selected_freqs, key_cache, value_cache, cache_index
         )
+        if self.self_attn._fp8_store is not None:
+            # The first store of the request computed the FP8 K/V scales; freeze
+            # them. Flipped here, at the eager boundary, so the compiled store
+            # specializes on it (one graph computes the scales, the rest reuse).
+            self.self_attn._kv_scales_set = True
         with _named_standard_gqa_attention_inputs(q, key_cache, value_cache):
             h = self._attention_tail(
                 hidden_states, q, key_cache, value_cache, attn_mask

@@ -27,6 +27,7 @@ Usage::
     outputs = model.generate(**encoded, max_new_tokens=32)
 """
 
+import os
 import types
 
 import torch
@@ -118,6 +119,12 @@ def prepare_for_spyre(model):
         for layer in backbone.layers:
             for norm in (layer.input_layernorm, layer.post_attention_layernorm):
                 norm.forward = types.MethodType(_fp16_rmsnorm_forward, norm)
+        # Opt-in: E4M3 KV cache with Q·Kᵀ on the FP8 engine (hf_adapters.fp8_kv).
+        # Needs torch.ops.spyre.scaled_bmm (torch-spyre#5158), and replaces the
+        # fused SDPA with explicit attention.
+        if os.environ.get("FP8_KV_CACHE") == "1":
+            model._spyre_fp8_kv_cache = True
+            print("FP8: E4M3 KV cache, Q·Kᵀ in FP8 (FP8_KV_CACHE=1)")
     prepare_rope_and_heads(model)
     pad_lm_head(model)
     model._spyre_compiled_blocks = prepare_standard_gqa_blocks(backbone.layers, True)
