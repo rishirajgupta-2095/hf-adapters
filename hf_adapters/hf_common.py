@@ -1423,7 +1423,15 @@ def allocate_kv_cache_tensor(
         device_layout=stl,
         dtype=dtype,
     )
-    cache.zero_()
+    if dtype == torch.float8_e4m3fn:
+        # The device's eager fill has no FP8 path ("RuntimeOperationFill:
+        # unsupported DataFormat for fill pattern conversion"), so copy zeros
+        # from the host instead; the copy honours the pinned layout. Leaving the
+        # cache uninitialized is not an option: stray E4M3 bytes can be NaN,
+        # and a NaN in an unwritten, masked slot still poisons its row.
+        cache.copy_(torch.zeros(shape, dtype=dtype))
+    else:
+        cache.zero_()
     return cache
 
 
