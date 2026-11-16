@@ -392,10 +392,8 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
         )
 
     raw = _scaled_bmm(q_fp8, key_cache, out_dtype=q.dtype)  # [B*NB, n_kv, g*L, 64]
-    # Scale in the block domain, before the permute: a multiply that reads the
-    # permuted view has no device layout at decode (L == 1 turns the view into
-    # 6D). With B == 1 the folded Q scale [1, n_kv, g*L, 1] broadcasts over the
-    # blocks as is.
+    # Scale in the block domain. With B == 1 the folded Q scale
+    # [1, n_kv, g*L, 1] broadcasts over the blocks as is.
     if B == 1:
         s_q = s_f
     else:
@@ -406,6 +404,11 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
             .reshape(B * n_blocks, n_kv, gL, 1)
         )
     scores = (raw * s_q * attn._k_scale * attn.scaling).to(q.dtype)
+    v = _dequantize(value_cache, attn._v_scale)  # fp16 [B*M, n_kv, Dh]
+
+    if B == 1 and L == 1:
+        return _decode_in_blocks(scores, v, attn_mask, n_q)
+
     # Blocks back into positions; heads are KV-major, so (kv, g) -> q head.
     scores = scores.reshape(B, n_blocks, n_kv, gL, KV_BLOCK).permute(0, 2, 3, 1, 4)
     scores = scores.reshape(B, n_q, L, M)
@@ -413,7 +416,34 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
         scores = scores + attn_mask.clamp(min=MASK_FLOOR)
     probs = torch.softmax(scores, dim=-1)
 
-    v = _dequantize(value_cache, attn._v_scale)  # fp16 [B*M, n_kv, Dh]
     v = v.reshape(B, M, n_kv, -1).permute(0, 2, 1, 3)  # [B, n_kv, M, Dh]
     out = torch.matmul(probs.reshape(B, n_kv, gL, M), v)  # DL16
     return out.reshape(B, n_q, L, -1)
+
+
+def _decode_in_blocks(scores, v, attn_mask, n_q):
+    """Decode (B == 1, L == 1) softmax and A·V without leaving the block domain.
+
+    ``scores`` ``[NB, n_kv, g, 64]`` (scaled); ``v`` fp16 ``[M, n_kv, Dh]``;
+    ``attn_mask`` ``[1, 1 or n_q, 1, M]``. Returns ``[1, n_q, 1, Dh]``.
+
+    Exactly ``softmax`` over all ``M = NB*64`` positions followed by ``A·V``,
+    but the scores are never permuted back to ``[1, n_q, 1, M]``: at L == 1 any
+    multi-input op that reads that permuted view has no device layout (the
+    view decomposes into 6D). The max and the sum are taken over the 64
+    positions and then over the blocks, one dim at a time, and ``A·V`` runs per
+    block and is summed over the blocks.
+    """
+    n_blocks, n_kv = scores.shape[:2]
+    if attn_mask is not None:
+        # Every head shares the decode mask: head 0's row, reshaped into blocks.
+        mask = attn_mask[:, :1].clamp(min=MASK_FLOOR)  # [1, 1, 1, M]
+        scores = scores + mask.reshape(n_blocks, 1, 1, KV_BLOCK)
+    m = scores.amax(dim=-1, keepdim=True).amax(dim=0, keepdim=True)  # [1, n_kv, g, 1]
+    e = torch.exp(scores - m)
+    denom = e.sum(dim=-1, keepdim=True).sum(dim=0, keepdim=True)  # [1, n_kv, g, 1]
+
+    # [M, n_kv, Dh] -> [NB, n_kv, 64, Dh]
+    v_blk = v.reshape(n_blocks, KV_BLOCK, n_kv, -1).permute(0, 2, 1, 3)
+    out = torch.matmul(e, v_blk).sum(dim=0, keepdim=True) / denom  # [1, n_kv, g, Dh]
+    return out.reshape(1, n_q, 1, -1)

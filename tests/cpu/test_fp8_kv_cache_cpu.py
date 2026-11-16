@@ -23,6 +23,7 @@ scatter, cross-graph layouts — cannot be tested here.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -131,9 +132,11 @@ def test_prefill_tracks_fp16_reference():
     assert _cos(got, _ref(q, k, v, 0, m)) > 0.995
 
 
-def test_decode_across_a_block_boundary():
+@pytest.mark.parametrize("b", [1, 2])  # B == 1 decodes in the block domain
+@pytest.mark.parametrize("mask_heads", [1, N_Q])  # hf_common may give one per head
+def test_decode_across_a_block_boundary(b, mask_heads):
     """Every decode step, including the first of a new block, tracks fp32."""
-    b, pre, steps, m = 2, 64, 66, 192  # decode writes 64..129: blocks 1 and 2
+    pre, steps, m = 64, 66, 192  # decode writes 64..129: blocks 1 and 2
     q, k, v = _qkv(b, pre + steps, seed=2)
     attn, kc, vc = _state(b, m)
 
@@ -145,7 +148,8 @@ def test_decode_across_a_block_boundary():
         sl = slice(pos, pos + 1)
         idx = fp8_cache_index(b, m, pos, 1)
         store_fp8_kv(attn, k[:, :, sl], v[:, :, sl], kc, vc, idx)
-        got = fp8_attention(attn, q[:, :, sl], kc, vc, _mask(pos, 1, m))
+        mask = _mask(pos, 1, m).expand(b, mask_heads, 1, m).contiguous()
+        got = fp8_attention(attn, q[:, :, sl], kc, vc, mask)
         assert torch.isfinite(got).all(), pos
         assert _cos(got, _ref(q[:, :, sl], k, v, pos, m)) > 0.995, pos
 
