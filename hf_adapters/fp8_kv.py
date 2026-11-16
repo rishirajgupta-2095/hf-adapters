@@ -392,11 +392,23 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
         )
 
     raw = _scaled_bmm(q_fp8, key_cache, out_dtype=q.dtype)  # [B*NB, n_kv, g*L, 64]
+    # Scale in the block domain, before the permute: a multiply that reads the
+    # permuted view has no device layout at decode (L == 1 turns the view into
+    # 6D). With B == 1 the folded Q scale [1, n_kv, g*L, 1] broadcasts over the
+    # blocks as is.
+    if B == 1:
+        s_q = s_f
+    else:
+        # TODO: B > 1 repeats the scale through a 5D view; untested on device.
+        s_q = (
+            s_f.unsqueeze(1)
+            .expand(B, n_blocks, n_kv, gL, 1)
+            .reshape(B * n_blocks, n_kv, gL, 1)
+        )
+    scores = (raw * s_q * attn._k_scale * attn.scaling).to(q.dtype)
     # Blocks back into positions; heads are KV-major, so (kv, g) -> q head.
-    raw = raw.reshape(B, n_blocks, n_kv, gL, KV_BLOCK).permute(0, 2, 3, 1, 4)
-    raw = raw.reshape(B, n_q, L, M)
-    s_q = s_f.reshape(B, n_q, L, 1)  # same (kv, g) -> q head order
-    scores = (raw * attn._k_scale * attn.scaling * s_q).to(q.dtype)
+    scores = scores.reshape(B, n_blocks, n_kv, gL, KV_BLOCK).permute(0, 2, 3, 1, 4)
+    scores = scores.reshape(B, n_q, L, M)
     if attn_mask is not None:
         scores = scores + attn_mask.clamp(min=MASK_FLOOR)
     probs = torch.softmax(scores, dim=-1)
