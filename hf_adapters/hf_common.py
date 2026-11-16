@@ -25,7 +25,7 @@ import math
 import os
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
@@ -1457,6 +1457,7 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
     if allocator := getattr(model, "_spyre_cache_allocator", None):
         return allocator(model, batch_size, max_cache_len, dtype, device)
     shapes = kv_cache_shapes(model)
+    model._spyre_cache_index_fn = None  # set again by allocators that need it
     if getattr(model, "_spyre_fp8_kv_cache", False):
         # Imported here, not at module load: hf_common must not import from its
         # own package (hf_adapters/__init__ imports adapters that import it).
@@ -2174,6 +2175,9 @@ def generate(
     key_caches, value_caches = allocate_kv_caches(
         model, batch_size, max_cache_len, model_d_type
     )
+    # Caches with their own layout (the FP8 KV cache) bring their own index
+    # builder, with ``make_cache_index``'s signature.
+    cache_index_fn = getattr(model, "_spyre_cache_index_fn", None) or make_cache_index
 
     # Decode state. Every decode step writes exactly one token at
     # ``current_cache_len``, so generated tokens are contiguous from ``padded_len``.
@@ -2219,7 +2223,7 @@ def generate(
                     attention_mask=prefill_mask,
                     key_caches=prefill_key_caches,
                     value_caches=prefill_value_caches,
-                    cache_index=make_cache_index(0, padded_len, DEVICE),
+                    cache_index=cache_index_fn(0, padded_len, DEVICE),
                     **normalized_token_inputs,
                 )
             else:
@@ -2243,7 +2247,7 @@ def generate(
                         prefill_mask.to(DEVICE),
                         prefill_key_caches,
                         prefill_value_caches,
-                        cache_index=make_cache_index(
+                        cache_index=cache_index_fn(
                             chunk_start, query_chunk_size, DEVICE
                         ),
                     )
@@ -2273,7 +2277,7 @@ def generate(
                 decode_mask = _materialize_decode_mask_heads(
                     decode_mask, decode_mask_heads
                 )
-            cache_index = make_cache_index(current_cache_len, 1, DEVICE)
+            cache_index = cache_index_fn(current_cache_len, 1, DEVICE)
             if decode_fn is None:
                 logits = run_forward_fn(  # type: ignore[misc]
                     model,
@@ -2524,9 +2528,7 @@ class StandardGQAAttention(nn.Module):
         if self._fp8_attention is not None:
             # Q·Kᵀ in FP8, softmax and A·V in fp16. Same [B, n_q, L, Dh] result
             # as SDPA, so the o_proj tail below is shared.
-            attn_out = self._fp8_attention(
-                self, q, key_cache, value_cache, attn_mask
-            )
+            attn_out = self._fp8_attention(self, q, key_cache, value_cache, attn_mask)
         else:
             attn_out = F.scaled_dot_product_attention(
                 q,
@@ -2622,7 +2624,14 @@ class StandardGQABlock(nn.Module):
             # them. Flipped here, at the eager boundary, so the compiled store
             # specializes on it (one graph computes the scales, the rest reuse).
             self.self_attn._kv_scales_set = True
-        with _named_standard_gqa_attention_inputs(q, key_cache, value_cache):
+        # The dim names describe SDPA's [B, n_kv, L, Dh] inputs; the FP8 path
+        # has its own cache layouts and no SDPA.
+        named = (
+            nullcontext()
+            if self.self_attn._fp8_attention is not None
+            else _named_standard_gqa_attention_inputs(q, key_cache, value_cache)
+        )
+        with named:
             h = self._attention_tail(
                 hidden_states, q, key_cache, value_cache, attn_mask
             )
