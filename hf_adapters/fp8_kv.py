@@ -247,14 +247,18 @@ def _per_tensor_scale(x, rng):
     """One scale for the whole tensor, ``amax(|x|) / rng`` -> ``[1, 1, 1, 1]``.
 
     The per-row amax comes from ``quantscalepertokenfp8`` (its ``scale_ub`` is
-    the divisor); the remaining reduction runs over a single flattened dim
-    rather than four at once.
+    the divisor); the rest is reduced one dim at a time. Flattening first
+    (``reshape(1, -1).amax(1)``) merges the head and position dims into one
+    reduction, which the device rejects: "More than one reduction dim is split
+    across cores".
     """
     if x.device.type == "spyre":
         rows = torch.ops.spyre.quantscalepertokenfp8(x, rng)  # [B, n_kv, n, 1]
     else:
         rows = (x.abs().amax(dim=-1, keepdim=True) / rng).clamp(min=1e-5)
-    return rows.reshape(1, -1).amax(dim=1).reshape(1, 1, 1, 1).to(SCALE_DTYPE)
+    s = rows.amax(dim=2, keepdim=True)  # positions -> [B, n_kv, 1, 1]
+    s = s.amax(dim=1, keepdim=True)  # heads -> [B, 1, 1, 1]
+    return s.amax(dim=0, keepdim=True).to(SCALE_DTYPE)  # batch -> [1, 1, 1, 1]
 
 
 def _quantize(x, scale, kernel: bool):
