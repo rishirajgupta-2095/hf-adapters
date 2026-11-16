@@ -368,37 +368,35 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
 
     # GQA fold: [B, n_kv, g*L, Dh].
     q_f = q.reshape(B, n_kv, gL, Dh)
-    # Per-token scale on the folded Q, before it is repeated: every block's copy
-    # has the same rows, and quantscalepertokenfp8 has no device layout for a
-    # read through the repeat's broadcast view.
+    # Quantize the folded Q once, then repeat the FP8 rows over the blocks.
+    # Neither the per-token scale nor quantize may read a repeated (broadcast)
+    # view on device: each failed in dbo-opt. The scale is applied to the
+    # scores instead, once they are back in [B, n_q, L, M].
     if q_f.device.type == "spyre":
         s_f = torch.ops.spyre.quantscalepertokenfp8(q_f, FP8_MAX)
     else:
         s_f = (q_f.abs().amax(dim=-1, keepdim=True) / FP8_MAX).clamp(min=1e-4)
+    q_fp8 = _quantize(q_f, s_f, kernel=False)  # QFP8CH, mat1
 
-    def per_block(x):
-        """[B, ...] -> [B*NB, ...]: one copy per K block."""
-        if B == 1:
-            # A plain 4D broadcast of the size-1 batch dim. The general form's
-            # unsqueeze -> expand -> reshape goes through a 5D view that the
-            # device has no layout for in whatever op reads it (the per-token
-            # scale, then quantize's reciprocal of the repeated scale).
-            return x.expand(n_blocks, *x.shape[1:])
-        # TODO: B > 1 still repeats through the 5D view; untested on device.
-        return (
-            x.unsqueeze(1)
-            .expand(B, n_blocks, *x.shape[1:])
-            .reshape(B * n_blocks, *x.shape[1:])
+    # One copy per K block: [B*NB, n_kv, g*L, Dh].
+    if B == 1:
+        # A plain 4D broadcast of the size-1 batch dim, without the general
+        # form's 5D unsqueeze -> expand -> reshape view.
+        q_fp8 = q_fp8.expand(n_blocks, n_kv, gL, Dh)
+    else:
+        # TODO: B > 1 repeats through a 5D view; untested on device.
+        q_fp8 = (
+            q_fp8.unsqueeze(1)
+            .expand(B, n_blocks, n_kv, gL, Dh)
+            .reshape(B * n_blocks, n_kv, gL, Dh)
         )
 
-    q_r, s_q = per_block(q_f), per_block(s_f)  # [B*NB, n_kv, g*L, Dh | 1]
-    q_fp8 = _quantize(q_r, s_q, kernel=False)  # QFP8CH, mat1
-
     raw = _scaled_bmm(q_fp8, key_cache, out_dtype=q.dtype)  # [B*NB, n_kv, g*L, 64]
-    scores = (raw * s_q * attn._k_scale * attn.scaling).to(q.dtype)
     # Blocks back into positions; heads are KV-major, so (kv, g) -> q head.
-    scores = scores.reshape(B, n_blocks, n_kv, gL, KV_BLOCK).permute(0, 2, 3, 1, 4)
-    scores = scores.reshape(B, n_q, L, M)
+    raw = raw.reshape(B, n_blocks, n_kv, gL, KV_BLOCK).permute(0, 2, 3, 1, 4)
+    raw = raw.reshape(B, n_q, L, M)
+    s_q = s_f.reshape(B, n_q, L, 1)  # same (kv, g) -> q head order
+    scores = (raw * attn._k_scale * attn.scaling * s_q).to(q.dtype)
     if attn_mask is not None:
         scores = scores + attn_mask.clamp(min=MASK_FLOOR)
     probs = torch.softmax(scores, dim=-1)
