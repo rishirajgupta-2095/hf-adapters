@@ -378,6 +378,13 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
 
     def per_block(x):
         """[B, ...] -> [B*NB, ...]: one copy per K block."""
+        if B == 1:
+            # A plain 4D broadcast of the size-1 batch dim. The general form's
+            # unsqueeze -> expand -> reshape goes through a 5D view that the
+            # device has no layout for in whatever op reads it (the per-token
+            # scale, then quantize's reciprocal of the repeated scale).
+            return x.expand(n_blocks, *x.shape[1:])
+        # TODO: B > 1 still repeats through the 5D view; untested on device.
         return (
             x.unsqueeze(1)
             .expand(B, n_blocks, *x.shape[1:])
