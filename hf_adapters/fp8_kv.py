@@ -362,17 +362,25 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
     M = n_blocks * KV_BLOCK
     gL = n_q // n_kv * L
 
-    # GQA fold, then one copy of Q per K block: [B*NB, n_kv, g*L, Dh].
+    # GQA fold: [B, n_kv, g*L, Dh].
     q_f = q.reshape(B, n_kv, gL, Dh)
-    q_r = (
-        q_f.unsqueeze(1)
-        .expand(B, n_blocks, n_kv, gL, Dh)
-        .reshape(B * n_blocks, n_kv, gL, Dh)
-    )
-    if q_r.device.type == "spyre":
-        s_q = torch.ops.spyre.quantscalepertokenfp8(q_r, FP8_MAX)
+    # Per-token scale on the folded Q, before it is repeated: every block's copy
+    # has the same rows, and quantscalepertokenfp8 has no device layout for a
+    # read through the repeat's broadcast view.
+    if q_f.device.type == "spyre":
+        s_f = torch.ops.spyre.quantscalepertokenfp8(q_f, FP8_MAX)
     else:
-        s_q = (q_r.abs().amax(dim=-1, keepdim=True) / FP8_MAX).clamp(min=1e-4)
+        s_f = (q_f.abs().amax(dim=-1, keepdim=True) / FP8_MAX).clamp(min=1e-4)
+
+    def per_block(x):
+        """[B, ...] -> [B*NB, ...]: one copy per K block."""
+        return (
+            x.unsqueeze(1)
+            .expand(B, n_blocks, *x.shape[1:])
+            .reshape(B * n_blocks, *x.shape[1:])
+        )
+
+    q_r, s_q = per_block(q_f), per_block(s_f)  # [B*NB, n_kv, g*L, Dh | 1]
     q_fp8 = _quantize(q_r, s_q, kernel=False)  # QFP8CH, mat1
 
     raw = _scaled_bmm(q_fp8, key_cache, out_dtype=q.dtype)  # [B*NB, n_kv, g*L, 64]
