@@ -95,6 +95,7 @@ def _run_forward(
     return run_lm_head(model, h)
 
 
+
 def _fp16_rmsnorm_forward(self, h):
     """RMSNorm with the variance reduction kept in fp16 on Spyre."""
     if h.device.type != "spyre":
@@ -131,4 +132,7 @@ def prepare_for_spyre(model):
     )
     model._spyre_compiled_blocks = prepare_standard_gqa_blocks(backbone.layers, True)
     model._spyre_compiled_norm = torch.compile(backbone.norm, dynamic=False)
-    model._spyre_prefill_chunk_size = _SDPA_MAX_SEQUENCE_TILE_SIZE
+    if not getattr(model, "_spyre_fp8_kv_cache", False):
+        # Chunked prefill passes [B, n_kv, :L, Dh] slices of the caches; the FP8
+        # KV cache's block layout has no such view, so it prefills in one shot.
+        model._spyre_prefill_chunk_size = _SDPA_MAX_SEQUENCE_TILE_SIZE

@@ -2310,9 +2310,7 @@ def _prefill_cache_inputs(caches, prefill_kv_len, chunked_prefill):
     ]
 
 
-def _cache_position_first_stl(
-    batch_size, num_kv_heads, max_cache_len, head_dim, dtype, element_arrangement=None
-):
+def _cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, head_dim, dtype):
     """Device layout for a ``[B, n_kv, L, hd]`` cache with ``L`` OUTERMOST on device.
 
     Indirect access (gather/scatter) requires the indexed dimension — here the
@@ -2347,7 +2345,7 @@ def _cache_position_first_stl(
     shape = [batch_size, num_kv_heads, max_cache_len, head_dim]
     eps = SpyreTensorLayout(shape, dtype).elems_per_stick()
     sticks = (head_dim + eps - 1) // eps
-    stl = SpyreTensorLayout(
+    return SpyreTensorLayout(
         device_size=[max_cache_len, num_kv_heads, sticks, batch_size, eps],
         stride_map=[
             head_dim,  # L
@@ -2358,11 +2356,6 @@ def _cache_position_first_stl(
         ],
         device_dtype=get_device_dtype(dtype),
     )
-    # FP8 KV cache (fp8_kv): tag the cache with the arrangement its quantize op
-    # produces, QFP8WT for K and QFP8CH for V. The device dims are unchanged.
-    if element_arrangement is not None:
-        stl = stl.with_element_arrangement(element_arrangement)
-    return stl
 
 
 def make_cache_index(start, length, device=None):
@@ -2383,13 +2376,7 @@ def make_cache_index(start, length, device=None):
 
 
 def allocate_kv_cache_tensor(
-    batch_size,
-    num_kv_heads,
-    max_cache_len,
-    head_dim,
-    dtype,
-    device=None,
-    element_arrangement=None,
+    batch_size, num_kv_heads, max_cache_len, head_dim, dtype, device=None
 ) -> torch.Tensor:
     """Allocate one zeroed KV tensor with a scatter-ready device layout."""
     if device is None:
@@ -2397,12 +2384,7 @@ def allocate_kv_cache_tensor(
     on_spyre = torch.device(device).type == "spyre"
     stl = (
         _cache_position_first_stl(
-            batch_size,
-            num_kv_heads,
-            max_cache_len,
-            head_dim,
-            dtype,
-            element_arrangement=element_arrangement,
+            batch_size, num_kv_heads, max_cache_len, head_dim, dtype
         )
         if on_spyre
         else None
@@ -2416,15 +2398,7 @@ def allocate_kv_cache_tensor(
         device_layout=stl,
         dtype=dtype,
     )
-    if dtype == torch.float8_e4m3fn:
-        # The device's eager fill has no FP8 path ("RuntimeOperationFill:
-        # unsupported DataFormat for fill pattern conversion"), so copy zeros
-        # from the host instead; the copy honours the pinned layout. Leaving the
-        # cache uninitialized is not an option: stray E4M3 bytes can be NaN,
-        # and a NaN in an unwritten, masked slot still poisons its row.
-        cache.copy_(torch.zeros(shape, dtype=dtype))
-    else:
-        cache.zero_()
+    cache.zero_()
     return cache
 
 
@@ -2453,6 +2427,9 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
     if allocator := getattr(model, "_spyre_cache_allocator", None):
         return allocator(model, batch_size, max_cache_len, dtype, device)
     shapes = kv_cache_shapes(model)
+    # Set again by allocators that need them.
+    model._spyre_cache_index_fn = None
+    model._spyre_after_prefill_fn = None
     if getattr(model, "_spyre_fp8_kv_cache", False):
         # Imported here, not at module load: hf_common must not import from its
         # own package (hf_adapters/__init__ imports adapters that import it).
@@ -3344,6 +3321,9 @@ def generate(
     key_caches, value_caches = allocate_kv_caches(
         model, batch_size, max_cache_len, model_d_type
     )
+    # Caches with their own layout (the FP8 KV cache) bring their own index
+    # builder, with ``make_cache_index``'s signature.
+    cache_index_fn = getattr(model, "_spyre_cache_index_fn", None) or make_cache_index
 
     # Decode state. Every decode step writes exactly one token at
     # ``current_cache_len``, so generated tokens are contiguous from ``padded_len``.
@@ -3410,7 +3390,7 @@ def generate(
                     attention_mask=prefill_mask,
                     key_caches=prefill_key_caches,
                     value_caches=prefill_value_caches,
-                    cache_index=make_cache_index(0, padded_len, DEVICE),
+                    cache_index=cache_index_fn(0, padded_len, DEVICE),
                     prefill_context=prefill_context,
                     **normalized_token_inputs,
                 )
@@ -3437,7 +3417,7 @@ def generate(
                         prefill_mask,
                         prefill_key_caches,
                         prefill_value_caches,
-                        cache_index=make_cache_index(
+                        cache_index=cache_index_fn(
                             chunk_start, query_chunk_size, DEVICE
                         ),
                     )
@@ -3453,6 +3433,10 @@ def generate(
             # instead of the full [B, S, V] prefill output.
             next_logits = logits[:, -1, :].to("cpu")
             current_cache_len = padded_len
+            # Per-request state that prefill fills in and decode only reads
+            # (the FP8 KV cache's K/V scales).
+            if after_prefill := getattr(model, "_spyre_after_prefill_fn", None):
+                after_prefill()
 
         else:
             # --- DECODE: one token in, one cache slot written ---
@@ -3476,7 +3460,7 @@ def generate(
                 decode_mask = _materialize_decode_mask_heads(
                     decode_mask, decode_mask_heads
                 )
-            cache_index = make_cache_index(current_cache_len, 1, DEVICE)
+            cache_index = cache_index_fn(current_cache_len, 1, DEVICE)
             if decode_fn is None:
                 logits = run_forward_fn(  # type: ignore[misc]
                     model,
@@ -3654,9 +3638,7 @@ class StandardGQAAttention(nn.Module):
         if self._fp8_attention is not None:
             # Q·Kᵀ in FP8, softmax and A·V in fp16. Same [B, n_q, L, Dh] result
             # as SDPA, so the o_proj tail below is shared.
-            attn_out = self._fp8_attention(
-                self, q, key_cache, value_cache, attn_mask
-            )
+            attn_out = self._fp8_attention(self, q, key_cache, value_cache, attn_mask)
         else:
             attn_out = F.scaled_dot_product_attention(
                 q,
