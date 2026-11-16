@@ -2430,6 +2430,7 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
     # Set again by allocators that need them.
     model._spyre_cache_index_fn = None
     model._spyre_after_prefill_fn = None
+    model._spyre_decode_mask_fn = None
     if getattr(model, "_spyre_fp8_kv_cache", False):
         # Imported here, not at module load: hf_common must not import from its
         # own package (hf_adapters/__init__ imports adapters that import it).
@@ -3460,6 +3461,10 @@ def generate(
                 decode_mask = _materialize_decode_mask_heads(
                     decode_mask, decode_mask_heads
                 )
+            # Caches with their own layout (the FP8 KV cache) may reshape the
+            # host mask into theirs, so the graph never reshapes its stick dim.
+            if decode_mask_fn := getattr(model, "_spyre_decode_mask_fn", None):
+                decode_mask = decode_mask_fn(decode_mask)
             cache_index = cache_index_fn(current_cache_len, 1, DEVICE)
             if decode_fn is None:
                 logits = run_forward_fn(  # type: ignore[misc]

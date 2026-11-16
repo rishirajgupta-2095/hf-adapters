@@ -156,6 +156,8 @@ def allocate_fp8_kv_caches(model, shapes, batch_size, max_cache_len, device):
         fp8_cache_index, batch_size, max_cache_len
     )
     model._spyre_after_prefill_fn = functools.partial(freeze_kv_scales, model)
+    if batch_size == 1:
+        model._spyre_decode_mask_fn = block_decode_mask
     return key_caches, value_caches
 
 
@@ -196,6 +198,18 @@ def freeze_kv_scales(model) -> None:
         attn = getattr(module, "self_attn", None)
         if attn is not None and getattr(attn, "_fp8_store", None) is not None:
             attn._kv_scales_set = True
+
+
+def block_decode_mask(mask):
+    """Host-side decode mask ``[1, 1 or n_q, 1, M]`` -> ``[NB, 1, 1, 64]``.
+
+    The B == 1 decode path (``_decode_in_blocks``) adds the mask to scores
+    shaped ``[NB, n_kv, g, 64]``. Splitting ``M`` into ``NB x 64`` would reshape
+    the stick dim, which a view on device may not do, so it is done here, on
+    the CPU mask, before it is moved. Every head shares the decode mask, so
+    head 0's row is enough.
+    """
+    return mask[:, :1].reshape(-1, 1, 1, KV_BLOCK).contiguous()
 
 
 def fp8_cache_index(batch_size, max_cache_len, start, length, device=None):
@@ -425,7 +439,8 @@ def _decode_in_blocks(scores, v, attn_mask, n_q):
     """Decode (B == 1, L == 1) softmax and A·V without leaving the block domain.
 
     ``scores`` ``[NB, n_kv, g, 64]`` (scaled); ``v`` fp16 ``[M, n_kv, Dh]``;
-    ``attn_mask`` ``[1, 1 or n_q, 1, M]``. Returns ``[1, n_q, 1, Dh]``.
+    ``attn_mask`` ``[NB, 1, 1, 64]``, already in blocks (``block_decode_mask``).
+    Returns ``[1, n_q, 1, Dh]``.
 
     Exactly ``softmax`` over all ``M = NB*64`` positions followed by ``A·V``,
     but the scores are never permuted back to ``[1, n_q, 1, M]``: at L == 1 any
@@ -436,9 +451,7 @@ def _decode_in_blocks(scores, v, attn_mask, n_q):
     """
     n_blocks, n_kv = scores.shape[:2]
     if attn_mask is not None:
-        # Every head shares the decode mask: head 0's row, reshaped into blocks.
-        mask = attn_mask[:, :1].clamp(min=MASK_FLOOR)  # [1, 1, 1, M]
-        scores = scores + mask.reshape(n_blocks, 1, 1, KV_BLOCK)
+        scores = scores + attn_mask.clamp(min=MASK_FLOOR)
     m = scores.amax(dim=-1, keepdim=True).amax(dim=0, keepdim=True)  # [1, n_kv, g, 1]
     e = torch.exp(scores - m)
     denom = e.sum(dim=-1, keepdim=True).sum(dim=0, keepdim=True)  # [1, n_kv, g, 1]

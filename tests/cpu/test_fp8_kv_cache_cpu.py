@@ -29,6 +29,7 @@ import torch.nn.functional as F
 
 from hf_adapters.fp8_kv import (
     KV_BLOCK,
+    block_decode_mask,
     fp8_attention,
     fp8_cache_index,
     store_fp8_kv,
@@ -149,6 +150,8 @@ def test_decode_across_a_block_boundary(b, mask_heads):
         idx = fp8_cache_index(b, m, pos, 1)
         store_fp8_kv(attn, k[:, :, sl], v[:, :, sl], kc, vc, idx)
         mask = _mask(pos, 1, m).expand(b, mask_heads, 1, m).contiguous()
+        if b == 1:  # as hf_common's decode loop hands it over
+            mask = block_decode_mask(mask)
         got = fp8_attention(attn, q[:, :, sl], kc, vc, mask)
         assert torch.isfinite(got).all(), pos
         assert _cos(got, _ref(q[:, :, sl], k, v, pos, m)) > 0.995, pos
