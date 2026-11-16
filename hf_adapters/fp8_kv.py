@@ -380,8 +380,12 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
     M = n_blocks * KV_BLOCK
     gL = n_q // n_kv * L
 
-    # GQA fold: [B, n_kv, g*L, Dh].
-    q_f = q.reshape(B, n_kv, gL, Dh)
+    # GQA fold: [B, n_kv, g*L, Dh]. ``q`` is RoPE's output seen through its
+    # flatten/transpose views; quantize (a two-input op, with the scale) cannot
+    # read that chain plus the fold at decode, where L == 1 composes it into a
+    # 6D view. clone() gives it a real buffer; contiguous() is a no-op there,
+    # since [B, n_q, 1, Dh] already counts as contiguous.
+    q_f = q.clone().reshape(B, n_kv, gL, Dh)
     # Quantize the folded Q once, then repeat the FP8 rows over the blocks.
     # Neither the per-token scale nor quantize may read a repeated (broadcast)
     # view on device: each failed in dbo-opt. The scale is applied to the
