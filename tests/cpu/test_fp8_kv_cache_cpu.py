@@ -32,6 +32,7 @@ from hf_adapters.fp8_kv import (
     block_decode_mask,
     fp8_attention,
     fp8_cache_index,
+    fp8_qk_attention,
     store_fp8_kv,
 )
 
@@ -210,3 +211,22 @@ def test_outlier_token_saturates_instead_of_nan():
     for stored in (kc[1, :, :, 0].float(), vc[64].float()):
         assert torch.isfinite(stored).all()
         assert stored.abs().max().item() == 448.0
+
+
+@pytest.mark.parametrize("b", [1, 2])
+def test_fp8_qk_attention_on_fp16_cache(b):
+    """FP8_QK_ATTN: prefill and decode on an ordinary fp16 cache track fp32."""
+    pre, m = 64, 128
+    q, k, v = _qkv(b, pre + 3, seed=11)
+    attn = SimpleNamespace(scaling=SCALING)
+    kc = torch.zeros(b, N_KV, m, DH, dtype=torch.float16)
+    vc = torch.zeros(b, N_KV, m, DH, dtype=torch.float16)
+    kc[:, :, :pre], vc[:, :, :pre] = k[:, :, :pre], v[:, :, :pre]
+    got = fp8_qk_attention(attn, q[:, :, :pre], kc, vc, _mask(0, pre, m))
+    assert torch.isfinite(got).all()
+    assert _cos(got, _ref(q[:, :, :pre], k, v, 0, m)) > 0.995
+    for pos in range(pre, pre + 3):  # decode: unit-scale Q
+        sl = slice(pos, pos + 1)
+        kc[:, :, sl], vc[:, :, sl] = k[:, :, sl], v[:, :, sl]
+        got = fp8_qk_attention(attn, q[:, :, sl], kc, vc, _mask(pos, 1, m))
+        assert _cos(got, _ref(q[:, :, sl], k, v, pos, m)) > 0.995, pos

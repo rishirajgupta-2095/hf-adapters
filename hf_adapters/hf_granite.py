@@ -32,6 +32,7 @@ import types
 
 import torch
 
+from hf_adapters.fp8_kv import fp8_qk_attention
 from hf_adapters.fp8_linear import swap_linears_to_fp8
 from hf_adapters.hf_common import (
     _SDPA_MAX_SEQUENCE_TILE_SIZE,
@@ -95,7 +96,6 @@ def _run_forward(
     return run_lm_head(model, h)
 
 
-
 def _fp16_rmsnorm_forward(self, h):
     """RMSNorm with the variance reduction kept in fp16 on Spyre."""
     if h.device.type != "spyre":
@@ -132,6 +132,14 @@ def prepare_for_spyre(model):
     )
     model._spyre_compiled_blocks = prepare_standard_gqa_blocks(backbone.layers, True)
     model._spyre_compiled_norm = torch.compile(backbone.norm, dynamic=False)
+    if os.environ.get("FP8_QK_ATTN") == "1" and not getattr(
+        model, "_spyre_fp8_kv_cache", False
+    ):
+        # Opt-in: Q·Kᵀ in FP8 on the ordinary fp16 KV cache; nothing stored in
+        # FP8. FP8_KV_CACHE=1 takes precedence (it has its own FP8 attention).
+        for layer in backbone.layers:
+            layer.self_attn._fp8_attention = fp8_qk_attention
+        print("FP8: Q·Kᵀ in FP8 on the fp16 KV cache (FP8_QK_ATTN=1)")
     if not getattr(model, "_spyre_fp8_kv_cache", False):
         # Chunked prefill passes [B, n_kv, :L, Dh] slices of the caches; the FP8
         # KV cache's block layout has no such view, so it prefills in one shot.

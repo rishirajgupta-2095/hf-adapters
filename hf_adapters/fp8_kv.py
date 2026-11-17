@@ -522,3 +522,56 @@ def _decode_in_blocks(scores, v, attn_mask, n_q):
     v_blk = v.reshape(n_blocks, KV_BLOCK, n_kv, -1).permute(0, 2, 1, 3)
     out = torch.matmul(e, v_blk).sum(dim=0, keepdim=True) / denom  # [1, n_kv, g, Dh]
     return out.reshape(1, n_q, 1, -1)
+
+
+# ---------------------------------------------------------------------------
+# Q·Kᵀ in FP8 on the fp16 KV cache (FP8_QK_ATTN=1)
+# ---------------------------------------------------------------------------
+
+
+def _quantize_k_unit(kt):
+    """fp16 Kᵀ ``[B, n_kv, Dh, M]`` -> E4M3 QFP8WT with a unit scale.
+
+    Clamp then convert: one-input ops only. K after RoPE stays well inside
+    E4M3's +-448, and E4M3 keeps 3 mantissa bits anywhere in [2^-6, 448].
+    """
+    if kt.device.type == "spyre":
+        return torch.ops.spyre.qfp8wt(kt.clamp(-FP8_MAX, FP8_MAX))
+    return kt.float().clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
+
+
+def fp8_qk_attention(attn, q, key_cache, value_cache, attn_mask):
+    """``softmax(Q · Kᵀ · scale + mask) · V`` with only ``Q · Kᵀ`` in FP8.
+
+    For the ordinary fp16 KV cache (``[B, n_kv, M, Dh]``, written by
+    ``kv_cache_update``): nothing is stored in FP8. Each call quantizes Q (as
+    ``fp8_attention`` does: per-token at prefill, unit scale at decode) and
+    the whole K cache, transposed, with a unit scale, then runs one
+    ``scaled_bmm`` over all positions; softmax and ``A · V`` stay fp16 on the
+    V cache as is. Batch dims match, so there is no per-tile repeat.
+    Returns fp16 ``[B, n_q, L, Dh]``, like SDPA.
+    """
+    B, n_q, L, Dh = q.shape
+    n_kv, M = key_cache.shape[1], key_cache.shape[2]
+    gL = n_q // n_kv * L
+
+    q_f = q.reshape(B, n_kv, gL, Dh)  # GQA fold
+    if L == 1:
+        s_q = None
+        q_fp8 = _quantize_q_decode(q_f)
+    else:
+        if q_f.device.type == "spyre":
+            s_q = torch.ops.spyre.quantscalepertokenfp8(q_f, FP8_MAX)
+        else:
+            s_q = (q_f.abs().amax(dim=-1, keepdim=True) / FP8_MAX).clamp(min=1e-4)
+        q_fp8 = _quantize(q_f, s_q, kernel=False)  # QFP8CH, mat1
+
+    k_fp8 = _quantize_k_unit(key_cache.transpose(-2, -1).contiguous())  # mat2
+    raw = _scaled_bmm(q_fp8, k_fp8, out_dtype=q.dtype)  # [B, n_kv, g*L, M]
+    scores = raw * attn.scaling if s_q is None else raw * s_q * attn.scaling
+    scores = scores.to(q.dtype).reshape(B, n_q, L, M)  # (kv, g) -> q head
+    if attn_mask is not None:
+        scores = scores + attn_mask.clamp(min=MASK_FLOOR)
+    probs = torch.softmax(scores, dim=-1)
+    out = torch.matmul(probs.reshape(B, n_kv, gL, M), value_cache)
+    return out.reshape(B, n_q, L, Dh)
