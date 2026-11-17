@@ -16,7 +16,9 @@
 
 Scheme::
 
-    Q   per-token scale (quantscalepertokenfp8), quantize_fp8_with_scale   -> QFP8CH
+    Q   prefill: per-token scale (quantscalepertokenfp8), quantize_fp8_with_scale
+        decode:  unit scale, clamp + spyre.qfp8ch (workaround, see
+                 _quantize_q_decode)                                    -> QFP8CH
     K   per-tensor scale, quantize_weight_fp8_with_scale, stored E4M3      -> QFP8WT
     V   per-tensor scale, quantize_fp8_with_scale, stored E4M3             -> QFP8CH
     Q · Kᵀ   spyre.scaled_bmm, 4D, reads the K cache as is  (torch-spyre#5158)
@@ -366,6 +368,26 @@ def _dequantize(x_fp8, scale):
     return (x_fp8.float() * scale.float()).to(scale.dtype)
 
 
+def _quantize_q_decode(q_f):
+    """Decode Q -> E4M3 QFP8CH with a unit scale: clamp, then convert.
+
+    TODO(torch-spyre): use the per-token scale here too, as prefill does. At
+    L == 1, Q (RoPE's output seen through flatten(3)/transpose(1, 2), plus the
+    GQA fold) composes into a 6D view, and any two-input pointwise op on it --
+    quantize_fp8_with_scale's ``q * (1/scale)`` -- fails layout propagation
+    (_project_pointwise_dim_order adds one leading axis too many when the
+    output order ends in the sparse-stick marker; AssertionError in
+    _is_supported_pointwise_layout). clamp and qfp8ch each have one input.
+
+    A unit scale is torch-spyre#5178's ``per_tensor_amax`` scheme. E4M3 keeps
+    3 mantissa bits for any |q| in [2^-6, 448], so only values outside that
+    range lose precision (clamped above, subnormal below).
+    """
+    if q_f.device.type == "spyre":
+        return torch.ops.spyre.qfp8ch(q_f.clamp(-FP8_MAX, FP8_MAX))
+    return q_f.float().clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
+
+
 def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
     """``softmax(Q · Kᵀ · scale + mask) · V`` with ``Q · Kᵀ`` in FP8.
 
@@ -380,21 +402,21 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
     M = n_blocks * KV_BLOCK
     gL = n_q // n_kv * L
 
-    # GQA fold: [B, n_kv, g*L, Dh]. ``q`` is RoPE's output seen through its
-    # flatten/transpose views; quantize (a two-input op, with the scale) cannot
-    # read that chain plus the fold at decode, where L == 1 composes it into a
-    # 6D view. clone() gives it a real buffer; contiguous() is a no-op there,
-    # since [B, n_q, 1, Dh] already counts as contiguous.
-    q_f = q.clone().reshape(B, n_kv, gL, Dh)
+    # GQA fold: [B, n_kv, g*L, Dh].
+    q_f = q.reshape(B, n_kv, gL, Dh)
     # Quantize the folded Q once, then repeat the FP8 rows over the blocks.
     # Neither the per-token scale nor quantize may read a repeated (broadcast)
     # view on device: each failed in dbo-opt. The scale is applied to the
-    # scores instead, once they are back in [B, n_q, L, M].
-    if q_f.device.type == "spyre":
-        s_f = torch.ops.spyre.quantscalepertokenfp8(q_f, FP8_MAX)
+    # scores instead.
+    if L == 1:
+        s_f = None
+        q_fp8 = _quantize_q_decode(q_f)
     else:
-        s_f = (q_f.abs().amax(dim=-1, keepdim=True) / FP8_MAX).clamp(min=1e-4)
-    q_fp8 = _quantize(q_f, s_f, kernel=False)  # QFP8CH, mat1
+        if q_f.device.type == "spyre":
+            s_f = torch.ops.spyre.quantscalepertokenfp8(q_f, FP8_MAX)
+        else:
+            s_f = (q_f.abs().amax(dim=-1, keepdim=True) / FP8_MAX).clamp(min=1e-4)
+        q_fp8 = _quantize(q_f, s_f, kernel=False)  # QFP8CH, mat1
 
     # One copy per K block: [B*NB, n_kv, g*L, Dh].
     if B == 1:
@@ -412,7 +434,9 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
     raw = _scaled_bmm(q_fp8, key_cache, out_dtype=q.dtype)  # [B*NB, n_kv, g*L, 64]
     # Scale in the block domain. With B == 1 the folded Q scale
     # [1, n_kv, g*L, 1] broadcasts over the blocks as is.
-    if B == 1:
+    if s_f is None:
+        s_q = 1.0  # decode: Q was quantized with a unit scale
+    elif B == 1:
         s_q = s_f
     else:
         # TODO: B > 1 repeats the scale through a 5D view; untested on device.
