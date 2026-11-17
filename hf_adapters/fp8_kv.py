@@ -136,6 +136,9 @@ def _allocate_v_cache(n_rows, n_kv, head_dim, device):
     shape = (n_rows, n_kv, head_dim)
     if torch.device(device).type != "spyre":
         return _fp8_zeros(shape, device)
+    # Start the runtime first: allocating with device_layout= needs a live
+    # RuntimeContext (as in hf_common._cache_position_first_stl).
+    torch.empty(1, device=device)
     from torch_spyre._C import (  # type: ignore[import-not-found]
         SpyreTensorLayout,
         get_device_dtype,
