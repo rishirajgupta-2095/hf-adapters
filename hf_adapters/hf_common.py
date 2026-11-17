@@ -3654,8 +3654,12 @@ class StandardGQAAttention(nn.Module):
                 scale=self.scaling,
                 enable_gqa=True,
             )
-        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
-        return self.o_proj(attn_out)
+        attn_out = attn_out.transpose(1, 2)  # [B, L, H, Dh]
+        # An FP8 o_proj quantizes before the head merge (see
+        # FP8Linear.forward_split_heads); any other o_proj takes the merged view.
+        if hasattr(self.o_proj, "forward_split_heads"):
+            return self.o_proj.forward_split_heads(attn_out)
+        return self.o_proj(attn_out.reshape(bsz, seq_len, -1))
 
     def forward(
         self,
