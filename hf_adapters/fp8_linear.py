@@ -116,6 +116,40 @@ class FP8Linear(nn.Module):
         acc = xq.reshape(-1, xq.shape[-1]).to(torch.float32) @ wq.to(torch.float32)
         return (acc.reshape(out_shape) * x_scale * self.weight_scale).to(x.dtype)
 
+    def forward_split_heads(self, x4: torch.Tensor) -> torch.Tensor:
+        """``forward`` on attention output still split into heads, ``[B, L, H, Dh]``.
+
+        For o_proj. Quantizing the merged ``[B, L, H*Dh]`` input means reading
+        the attention output through its head-merge reshape, and torch-spyre's
+        layout propagation cannot project that view for the two-input
+        quantize (``_project_pointwise_dim_order`` assumes extra rank is a
+        leading axis; here it is a trailing split, H*Dh -> H x Dh). So the
+        per-token scale and the quantize run on the 4D tensor and only the
+        FP8 result is merged, for ``scaled_mm``. The per-token scale is the
+        same: the max over heads of the per-head max.
+        """
+        b, n, h, d = x4.shape
+        if x4.device.type != "spyre":
+            return self.forward(x4.reshape(b, n, h * d))
+        x_scale = (
+            torch.ops.spyre.quantscalepertokenfp8(x4, FP8_MAX)  # [B, L, H, 1]
+            .amax(dim=-2, keepdim=True)  # [B, L, 1, 1]: per token
+            .clone()
+        )
+        wq = (
+            self.weight
+            if self.prequantized
+            else torch.ops.spyre.quantize_weight_fp8_with_scale(
+                self.weight, self.weight_scale
+            )
+        )
+        xq = torch.ops.spyre.quantize_fp8_with_scale(x4, x_scale)
+        y: torch.Tensor = torch.ops.spyre.scaled_mm(
+            xq.reshape(b * n, h * d), wq, out_dtype=self.compute_dtype
+        )
+        y = y.reshape(b, n, self.out_features) * x_scale.reshape(b, n, 1)
+        return (y * self.weight_scale).to(x4.dtype)
+
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
