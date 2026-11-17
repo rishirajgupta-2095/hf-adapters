@@ -123,6 +123,39 @@ def _allocate_k_cache(n_blocks, n_kv, head_dim, device):
     return _qfp8wt_zeros_compiled(z, s)
 
 
+def _allocate_v_cache(n_rows, n_kv, head_dim, device):
+    """Zeroed ``[n_rows, n_kv, head_dim]`` V cache with the row dim outermost on device.
+
+    V rows are written by ``index_copy_`` along dim 0, and an indirect scatter
+    needs the indexed dim at device position 0: otherwise torch-spyre writes the
+    wrong rows, silently (torch-spyre#3705; see ``hf_common.kv_cache_update``).
+    The default layout of a ``[128, 8, 128]`` FP8 tensor puts the heads first
+    (device_size ``[8, 1, 128, 128]``, measured), so the layout is pinned here,
+    as ``hf_common._cache_position_first_stl`` does for the fp16 caches.
+    """
+    shape = (n_rows, n_kv, head_dim)
+    if torch.device(device).type != "spyre":
+        return _fp8_zeros(shape, device)
+    from torch_spyre._C import (  # type: ignore[import-not-found]
+        SpyreTensorLayout,
+        get_device_dtype,
+    )
+
+    eps = SpyreTensorLayout(list(shape), FP8_DTYPE).elems_per_stick()
+    sticks = (head_dim + eps - 1) // eps
+    stl = SpyreTensorLayout(
+        device_size=[n_rows, n_kv, sticks, eps],
+        stride_map=[n_kv * head_dim, head_dim, eps, 1],
+        device_dtype=get_device_dtype(FP8_DTYPE),
+    )
+    cache: torch.Tensor = torch.empty(  # type: ignore[call-overload]
+        shape, device=torch.device(device), device_layout=stl, dtype=FP8_DTYPE
+    )
+    # The device has no FP8 fill; a copy from the host keeps the pinned layout.
+    cache.copy_(torch.zeros(shape, dtype=torch.uint8).view(FP8_DTYPE))
+    return cache
+
+
 def allocate_fp8_kv_caches(model, shapes, batch_size, max_cache_len, device):
     """E4M3 key (QFP8WT blocks) and value (QFP8CH rows) caches, plus scales.
 
@@ -140,10 +173,8 @@ def allocate_fp8_kv_caches(model, shapes, batch_size, max_cache_len, device):
         _allocate_k_cache(batch_size * n_blocks, n_kv, hd, device)
         for (n_kv, hd, _vhd) in shapes
     ]
-    # V rows are written with a plain dim-0 scatter, which a host-allocated
-    # (STANDARD) FP8 tensor takes; torch-spyre#5178's tests do the same.
     value_caches = [
-        _fp8_zeros((batch_size * max_cache_len, n_kv, vhd), device)
+        _allocate_v_cache(batch_size * max_cache_len, n_kv, vhd, device)
         for (n_kv, _hd, vhd) in shapes
     ]
 
