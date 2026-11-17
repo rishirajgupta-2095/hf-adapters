@@ -19,6 +19,7 @@ Per-output-channel weight scale, per-token dynamic activation scale, no bias.
 
 from __future__ import annotations
 
+import os
 from typing import cast
 
 import torch
@@ -32,7 +33,14 @@ SCALE_CLIP_MIN = 2.0**-23
 
 # TODO: o_proj and down_proj fail torch-spyre FP8 codegen (DtException on
 # o_proj, ReStickifyOpHBM on SEN143_FP8 for down_proj); kept fp16 until fixed.
-DEFAULT_FP8_EXCLUDE = ("o_proj", "down_proj")
+# torch-spyre#4741 (merged 2026-09-30) addresses down_proj; o_proj also needed
+# a split-heads change in September. FP8_EXCLUDE overrides the list for trying
+# them: comma-separated names, empty for all seven projections in FP8.
+DEFAULT_FP8_EXCLUDE: tuple[str, ...] = tuple(
+    name.strip()
+    for name in os.environ.get("FP8_EXCLUDE", "o_proj,down_proj").split(",")
+    if name.strip()
+)
 
 
 class FP8Linear(nn.Module):
