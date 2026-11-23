@@ -52,6 +52,7 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    indirect_access
    indirect_access_work_division
    element_arrangement
+   fp8_inference
 
 .. toctree::
    :maxdepth: 2
