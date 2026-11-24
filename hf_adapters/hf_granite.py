@@ -140,7 +140,7 @@ def prepare_for_spyre(model):
         for layer in backbone.layers:
             layer.self_attn._fp8_attention = fp8_qk_attention
         print("FP8: Q·Kᵀ in FP8 on the fp16 KV cache (FP8_QK_ATTN=1)")
-    if not getattr(model, "_spyre_fp8_kv_cache", False):
-        # Chunked prefill passes [B, n_kv, :L, Dh] slices of the caches; the FP8
-        # KV cache's block layout has no such view, so it prefills in one shot.
-        model._spyre_prefill_chunk_size = _SDPA_MAX_SEQUENCE_TILE_SIZE
+    # Chunked prefill for every path. The FP8 KV cache has no [B, n_kv, :L, Dh]
+    # slice, so its allocator asks generate() for whole caches instead
+    # (``_spyre_prefill_full_cache``); its static scales keep chunks consistent.
+    model._spyre_prefill_chunk_size = _SDPA_MAX_SEQUENCE_TILE_SIZE

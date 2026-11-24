@@ -15,8 +15,9 @@
 """CPU tests for the FP8 KV cache math (hf_adapters.fp8_kv) — no Spyre needed.
 
 These cover what is ours to get right: the GQA fold, the K block / V row cache
-layouts and their indices, the decode staging block, the per-tensor K/V scales
-and their freezing, the clamp, and the scale bookkeeping around the FP8 Q·Kᵀ.
+layouts and their indices, the decode staging block, chunked prefill, the
+static Q/K/V scales (checkpoint or 1.0), the clamp, and the scale bookkeeping
+around the FP8 Q·Kᵀ.
 Device-side questions — scaled_bmm (torch-spyre#5158), whole-block QFP8WT
 scatter, cross-graph layouts — cannot be tested here.
 """
@@ -29,6 +30,7 @@ import torch.nn.functional as F
 
 from hf_adapters.fp8_kv import (
     KV_BLOCK,
+    _static_scale,
     block_decode_mask,
     fp8_attention,
     fp8_cache_index,
@@ -40,13 +42,14 @@ N_Q, N_KV, DH = 8, 2, 128
 SCALING = DH**-0.5
 
 
-def _state(b, m):
+def _state(b, m, scales=(1.0, 1.0, 1.0)):
     """An attention module's FP8 attributes, plus empty K and V caches."""
+    _q_s, k_s, v_s = scales
     attn = SimpleNamespace(
         scaling=SCALING,
-        _k_scale=torch.ones(1, 1, 1, 1, dtype=torch.float16),
-        _v_scale=torch.ones(1, 1, 1, dtype=torch.float16),
-        _kv_scales_set=False,
+        _fp8_scales=scales,
+        _k_scale=torch.full((1, 1, 1, 1), k_s, dtype=torch.float16),
+        _v_scale=torch.full((1, 1, 1), v_s, dtype=torch.float16),
         _k_staging=torch.zeros(KV_BLOCK, b, N_KV, DH, dtype=torch.float16),
     )
     # Byte 0x00 is +0.0 in E4M3.
@@ -120,7 +123,7 @@ def test_cache_index_prefill_and_decode():
 
 
 def test_prefill_tracks_fp16_reference():
-    """Prefill: FP8 Q·Kᵀ with per-token Q and per-tensor K/V stays close to fp32."""
+    """Prefill: FP8 Q·Kᵀ with static unit Q/K/V scales stays close to fp32."""
     b, length, m = 2, 128, 256
     q, k, v = _qkv(b, length, seed=1)
     attn, kc, vc = _state(b, m)
@@ -145,7 +148,6 @@ def test_decode_across_a_block_boundary(b, mask_heads):
     store_fp8_kv(
         attn, k[:, :, :pre], v[:, :, :pre], kc, vc, fp8_cache_index(b, m, 0, pre)
     )
-    attn._kv_scales_set = True  # freeze_kv_scales does this after prefill
     for pos in range(pre, pre + steps):
         sl = slice(pos, pos + 1)
         idx = fp8_cache_index(b, m, pos, 1)
@@ -158,24 +160,70 @@ def test_decode_across_a_block_boundary(b, mask_heads):
         assert _cos(got, _ref(q[:, :, sl], k, v, pos, m)) > 0.995, pos
 
 
-def test_first_store_sets_scales_then_they_freeze():
-    """Scales come from the first store; later stores reuse them unchanged."""
-    _, k, v = _qkv(1, 64, seed=3)
+@pytest.mark.parametrize("b", [1, 2])
+def test_chunked_prefill_matches_one_shot(b):
+    """Prefill in 128-position chunks stores the same bytes as one shot, and each
+    chunk's attention over the whole cache (later positions masked) tracks fp32."""
+    length, chunk, m = 384, 128, 512
+    q, k, v = _qkv(b, length, seed=12)
+
+    attn1, kc1, vc1 = _state(b, m)
+    store_fp8_kv(attn1, k, v, kc1, vc1, fp8_cache_index(b, m, 0, length))
+
+    attn, kc, vc = _state(b, m)
+    for start in range(0, length, chunk):
+        sl = slice(start, start + chunk)
+        idx = fp8_cache_index(b, m, start, chunk)
+        store_fp8_kv(attn, k[:, :, sl], v[:, :, sl], kc, vc, idx)
+        got = fp8_attention(attn, q[:, :, sl], kc, vc, _mask(start, chunk, m))
+        assert torch.isfinite(got).all(), start
+        assert _cos(got, _ref(q[:, :, sl], k, v, start, m)) > 0.995, start
+
+    assert torch.equal(kc.view(torch.uint8), kc1.view(torch.uint8))
+    assert torch.equal(vc.view(torch.uint8), vc1.view(torch.uint8))
+
+
+def test_stores_never_change_the_static_scales():
+    """Scales are static: no store, prefill or decode, writes them."""
+    _, k, v = _qkv(1, 65, seed=3, scale=5.0)
     attn, kc, vc = _state(1, 128)
+    before = (attn._k_scale.clone(), attn._v_scale.clone(), attn._fp8_scales)
+    store_fp8_kv(
+        attn, k[:, :, :64], v[:, :, :64], kc, vc, fp8_cache_index(1, 128, 0, 64)
+    )
+    store_fp8_kv(
+        attn, k[:, :, 64:], v[:, :, 64:], kc, vc, fp8_cache_index(1, 128, 64, 1)
+    )
+    assert torch.equal(attn._k_scale, before[0])
+    assert torch.equal(attn._v_scale, before[1])
+    assert attn._fp8_scales == before[2]
 
-    store_fp8_kv(attn, k, v, kc, vc, fp8_cache_index(1, 128, 0, 64))
-    expect_k = k.float().abs().amax() / 200.0
-    expect_v = v.float().abs().amax() / 100.0
-    got_k, got_v = attn._k_scale.float().flatten(), attn._v_scale.float().flatten()
-    torch.testing.assert_close(got_k, expect_k.view(1), rtol=1e-3, atol=0)
-    torch.testing.assert_close(got_v, expect_v.view(1), rtol=1e-3, atol=0)
 
-    attn._kv_scales_set = True
-    frozen_k, frozen_v = attn._k_scale.clone(), attn._v_scale.clone()
-    _, k2, v2 = _qkv(1, 1, seed=4, scale=5.0)  # a much larger decode token
-    store_fp8_kv(attn, k2, v2, kc, vc, fp8_cache_index(1, 128, 64, 1))
-    assert torch.equal(attn._k_scale, frozen_k)
-    assert torch.equal(attn._v_scale, frozen_v)
+def test_checkpoint_scales_are_used():
+    """Static scales from the checkpoint: 1.0 when absent, the value when per
+    layer, rejected when per KV head (not supported yet)."""
+    plain = SimpleNamespace(_checkpoint_scales={})
+    assert _static_scale(plain, "k_scale") == 1.0
+    ckpt = SimpleNamespace(_checkpoint_scales={"k_scale": torch.tensor([0.25])})
+    assert _static_scale(ckpt, "k_scale") == 0.25
+    per_head = SimpleNamespace(_checkpoint_scales={"v_scale": torch.ones(N_KV)})
+    with pytest.raises(NotImplementedError):
+        _static_scale(per_head, "v_scale")
+
+
+def test_small_activations_need_their_static_scale():
+    """Q/K/V around 1e-3: E4M3 at scale 1.0 is subnormal there, while a matching
+    static scale keeps full precision. Shows the scales are applied end to end."""
+    b, length, m, s = 1, 64, 128, 1e-3
+    q, k, v = _qkv(b, length, seed=13, scale=s)
+    ref = _ref(q, k, v, 0, m)
+    cos = {}
+    for scales in ((1.0, 1.0, 1.0), (s, s, s)):
+        attn, kc, vc = _state(b, m, scales)
+        store_fp8_kv(attn, k, v, kc, vc, fp8_cache_index(b, m, 0, length))
+        cos[scales[0]] = _cos(fp8_attention(attn, q, kc, vc, _mask(0, length, m)), ref)
+    assert cos[s] > 0.995
+    assert cos[s] > cos[1.0]
 
 
 def test_decode_rewrite_keeps_earlier_tokens():
@@ -185,7 +233,6 @@ def test_decode_rewrite_keeps_earlier_tokens():
     store_fp8_kv(
         attn, k[:, :, :64], v[:, :, :64], kc, vc, fp8_cache_index(1, 128, 0, 64)
     )
-    attn._kv_scales_set = True
 
     store_fp8_kv(
         attn, k[:, :, 64:65], v[:, :, 64:65], kc, vc, fp8_cache_index(1, 128, 64, 1)
@@ -199,13 +246,12 @@ def test_decode_rewrite_keeps_earlier_tokens():
 
 
 def test_outlier_token_saturates_instead_of_nan():
-    """A token beyond the headroom is clamped to +-448, never stored as NaN."""
+    """A value beyond +-448 (at its static scale) is clamped, never stored as NaN."""
     _, k, v = _qkv(1, 64, seed=6)
     attn, kc, vc = _state(1, 128)
     store_fp8_kv(attn, k, v, kc, vc, fp8_cache_index(1, 128, 0, 64))
-    attn._kv_scales_set = True
 
-    _, k_big, v_big = _qkv(1, 1, seed=7, scale=50.0)  # far past 2.24x headroom
+    _, k_big, v_big = _qkv(1, 1, seed=7, scale=1000.0)  # randn * 1000 >> 448
     store_fp8_kv(attn, k_big, v_big, kc, vc, fp8_cache_index(1, 128, 64, 1))
 
     for stored in (kc[1, :, :, 0].float(), vc[64].float()):
@@ -225,7 +271,7 @@ def test_fp8_qk_attention_on_fp16_cache(b):
     got = fp8_qk_attention(attn, q[:, :, :pre], kc, vc, _mask(0, pre, m))
     assert torch.isfinite(got).all()
     assert _cos(got, _ref(q[:, :, :pre], k, v, 0, m)) > 0.995
-    for pos in range(pre, pre + 3):  # decode: unit-scale Q
+    for pos in range(pre, pre + 3):  # decode
         sl = slice(pos, pos + 1)
         kc[:, :, sl], vc[:, :, sl] = k[:, :, sl], v[:, :, sl]
         got = fp8_qk_attention(attn, q[:, :, sl], kc, vc, _mask(pos, 1, m))

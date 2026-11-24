@@ -2431,6 +2431,7 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
     model._spyre_cache_index_fn = None
     model._spyre_after_prefill_fn = None
     model._spyre_decode_mask_fn = None
+    model._spyre_prefill_full_cache = False
     if getattr(model, "_spyre_fp8_kv_cache", False):
         # Imported here, not at module load: hf_common must not import from its
         # own package (hf_adapters/__init__ imports adapters that import it).
@@ -3325,6 +3326,11 @@ def generate(
     # Caches with their own layout (the FP8 KV cache) bring their own index
     # builder, with ``make_cache_index``'s signature.
     cache_index_fn = getattr(model, "_spyre_cache_index_fn", None) or make_cache_index
+    # Caches with no position slice (the FP8 KV cache's K blocks) are passed to
+    # prefill whole, chunked or not, with the prefill mask over the full cache.
+    prefill_full_cache = bool(getattr(model, "_spyre_prefill_full_cache", False))
+    if prefill_full_cache:
+        prefill_kv_len = max_cache_len
 
     # Decode state. Every decode step writes exactly one token at
     # ``current_cache_len``, so generated tokens are contiguous from ``padded_len``.
@@ -3354,11 +3360,12 @@ def generate(
             # full-extent slice is a view, and an in-place compiled update
             # through that view does not reliably seed the tensors consumed by
             # decode on Spyre.
+            slice_caches = chunked_prefill and not prefill_full_cache
             prefill_key_caches = _prefill_cache_inputs(
-                key_caches, prefill_kv_len, chunked_prefill
+                key_caches, prefill_kv_len, slice_caches
             )
             prefill_value_caches = _prefill_cache_inputs(
-                value_caches, prefill_kv_len, chunked_prefill
+                value_caches, prefill_kv_len, slice_caches
             )
             if prefill_fn is not None:
                 prefill_context: PrefillContext | None = None
@@ -3584,15 +3591,22 @@ class StandardGQAAttention(nn.Module):
         self.head_dim = attn.head_dim
         self.v_head_dim = getattr(attn, "v_head_dim", attn.head_dim)
         self.scaling = attn.scaling
+        # Static attention scales a quantized checkpoint may put on the module
+        # (compressed-tensors ``kv_cache_scheme``); read by the FP8 KV cache.
+        self._checkpoint_scales = {
+            name: scale
+            for name in ("q_scale", "k_scale", "v_scale")
+            if isinstance(scale := getattr(attn, name, None), torch.Tensor)
+        }
         # FP8 KV cache (fp8_kv): set per request by fp8_kv.attach_fp8_kv. The two
         # functions are injected rather than imported because hf_common must not
         # import from its own package. All plain attributes, so Dynamo
         # specializes on which path runs instead of breaking the graph.
         self._fp8_store = None
         self._fp8_attention = None
+        self._fp8_scales = None
         self._k_scale = None
         self._v_scale = None
-        self._kv_scales_set = False
 
     def pre_attn(
         self,

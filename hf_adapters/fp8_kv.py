@@ -14,13 +14,11 @@
 
 """FP8 (E4M3) KV cache with ``Q · Kᵀ`` on the FP8 engine and ``A · V`` in DL16.
 
-Scheme::
+Scheme (all scales static, see "Scales" below)::
 
-    Q   prefill: per-token scale (quantscalepertokenfp8), quantize_fp8_with_scale
-        decode:  unit scale, clamp + spyre.qfp8ch (workaround, see
-                 _quantize_q_decode)                                    -> QFP8CH
-    K   per-tensor scale, quantize_weight_fp8_with_scale, stored E4M3      -> QFP8WT
-    V   per-tensor scale, quantize_fp8_with_scale, stored E4M3             -> QFP8CH
+    Q   x / q_scale, clamp(+-448), spyre.qfp8ch                         -> QFP8CH
+    K   quantize_weight_fp8_with_scale(x, k_scale), stored E4M3          -> QFP8WT
+    V   quantize_fp8_with_scale(x, v_scale), stored E4M3                 -> QFP8CH
     Q · Kᵀ   spyre.scaled_bmm, 4D, reads the K cache as is  (torch-spyre#5158)
     A · V    dequantize V, then an fp16 matmul
 
@@ -50,12 +48,16 @@ carries the QFP8WT layout and a later graph reads it correctly. A host
 allocation copied to the device gets the STANDARD layout, which reads back
 wrong in the next graph.
 
-K and V scales follow ``fms_mo/aiu_addons/fp8/fp8_attn.py``: ``amax / 200`` for
-K and ``amax / 100`` for V, computed on the first store and then frozen. Mapping
-the prefill amax below 448 leaves headroom (2.24x for K, 4.48x for V) for decode
-tokens larger than anything seen at prefill; beyond that the quantize clamps
-rather than overflowing to NaN. One scale per layer covers the whole batch, so
-every K block shares it.
+Scales: static, one per layer for each of Q, K and V, as in vLLM and
+spyre-inference. They come from the checkpoint (``q_scale`` / ``k_scale`` /
+``v_scale`` on the attention module) when it ships them, else 1.0; the FP8
+Granite checkpoints ship none (``kv_cache_scheme: null``), so all three are 1.0
+there. The clamp to +-448 is explicit (built into the quantize ops for K and V,
+written out for Q). A static scale is what makes chunked prefill and the decode
+block rewrite exact: every chunk and every rewrite quantizes with the same
+scale, so positions written earlier keep their bytes. Q is quantized with
+one-input ops only (a multiply by a constant, clamp, ``qfp8ch``): a two-input op
+on RoPE's output fails layout propagation at L == 1 (see ``_quantize_q``).
 
 GQA: ``scaled_bmm`` needs matching batch dims, and Granite has 32 query heads
 against 8 KV heads. Instead of repeating K and V four times over (FMS's
@@ -79,8 +81,7 @@ import torch
 from .fp8_linear import FP8_DTYPE, FP8_MAX
 
 KV_BLOCK = 64  # positions per K block: the N extent of one QFP8WT stick
-K_RANGE = 200.0  # fms_mo fp8_attn.py; "these come from vLLM"
-V_RANGE = 100.0
+DEFAULT_SCALE = 1.0  # static Q/K/V scale when the checkpoint ships none
 SCALE_DTYPE = torch.float16  # dequantize_fp8_with_scale requires an fp16 scale
 STAGING_DTYPE = torch.float16  # FP8Linear outputs fp16
 
@@ -191,17 +192,43 @@ def allocate_fp8_kv_caches(model, shapes, batch_size, max_cache_len, device):
     model._spyre_cache_index_fn = functools.partial(
         fp8_cache_index, batch_size, max_cache_len
     )
-    model._spyre_after_prefill_fn = functools.partial(freeze_kv_scales, model)
+    # The K cache's block layout has no position slice, so prefill (chunked or
+    # not) is handed the whole caches and a mask over every cache position.
+    model._spyre_prefill_full_cache = True
     if batch_size == 1:
         model._spyre_decode_mask_fn = block_decode_mask
     return key_caches, value_caches
 
 
+def _static_scale(attn, name) -> float:
+    """The layer's static ``name`` scale from the checkpoint, else 1.0.
+
+    ``StandardGQAAttention`` keeps any ``q_scale`` / ``k_scale`` / ``v_scale``
+    the checkpoint put on the attention module in ``_checkpoint_scales``.
+    """
+    scale = getattr(attn, "_checkpoint_scales", {}).get(name)
+    if scale is None:
+        return DEFAULT_SCALE
+    if scale.numel() != 1:
+        # TODO: per-KV-head static scales broadcast as [1, n_kv, 1, 1] on K and
+        # the scores and [1, n_kv, 1] on V; Q would need a two-input quantize.
+        raise NotImplementedError(
+            f"FP8 KV cache: per-KV-head {name} {tuple(scale.shape)} is not "
+            "supported yet; only one static scale per layer"
+        )
+    value = float(scale.detach().to("cpu").reshape(()))
+    if not value > 0.0:
+        raise ValueError(f"FP8 KV cache: {name} must be positive, got {value}")
+    return value
+
+
 def attach_fp8_kv(model, shapes, batch_size, device) -> int:
     """Turn the FP8 KV path on in every attention module, with fresh state.
 
-    Scales start at 1 and ``_kv_scales_set`` at False, so the first store of the
-    request overwrites them. Returns the number of modules wired up.
+    Sets the layer's static scales (``_fp8_scales`` as floats for Q and the
+    score rescale; ``_k_scale`` / ``_v_scale`` as fp16 tensors for the K/V
+    quantize and the V dequantize) and a zeroed K staging block. Returns the
+    number of modules wired up.
     """
     attns = [
         attn
@@ -210,30 +237,19 @@ def attach_fp8_kv(model, shapes, batch_size, device) -> int:
         and hasattr(attn, "pre_attn")
     ]
     for attn, (n_kv, hd, _vhd) in zip(attns, shapes):
-        attn._k_scale = torch.ones((1, 1, 1, 1), dtype=SCALE_DTYPE, device=device)
-        attn._v_scale = torch.ones((1, 1, 1), dtype=SCALE_DTYPE, device=device)
-        attn._kv_scales_set = False
+        q_s, k_s, v_s = (
+            _static_scale(attn, n) for n in ("q_scale", "k_scale", "v_scale")
+        )
+        attn._fp8_scales = (q_s, k_s, v_s)
+        # Built on the host, then moved: a contiguous H2D copy.
+        attn._k_scale = torch.full((1, 1, 1, 1), k_s, dtype=SCALE_DTYPE).to(device)
+        attn._v_scale = torch.full((1, 1, 1), v_s, dtype=SCALE_DTYPE).to(device)
         attn._k_staging = torch.zeros(
             (KV_BLOCK, batch_size, n_kv, hd), dtype=STAGING_DTYPE, device=device
         )
         attn._fp8_store = store_fp8_kv
         attn._fp8_attention = fp8_attention
     return len(attns)
-
-
-def freeze_kv_scales(model) -> None:
-    """After prefill: mark every layer's K/V scales as set, so decode reuses them.
-
-    ``_kv_scales_set`` is a plain bool read inside the compiled block, so Dynamo
-    specializes on it: the prefill graph computes the scales and the decode
-    graphs only read them. It is flipped here, from ``generate`` between prefill
-    and the first decode step, because the block is one compiled graph with no
-    eager step between the store and attention.
-    """
-    for module in model.modules():
-        attn = getattr(module, "self_attn", None)
-        if attn is not None and getattr(attn, "_fp8_store", None) is not None:
-            attn._kv_scales_set = True
 
 
 def block_decode_mask(mask):
@@ -293,24 +309,6 @@ def fp8_cache_index(batch_size, max_cache_len, start, length, device=None):
 # ---------------------------------------------------------------------------
 
 
-def _per_tensor_scale(x, rng):
-    """One scale for the whole tensor, ``amax(|x|) / rng`` -> ``[1, 1, 1, 1]``.
-
-    The per-row amax comes from ``quantscalepertokenfp8`` (its ``scale_ub`` is
-    the divisor); the rest is reduced one dim at a time. Flattening first
-    (``reshape(1, -1).amax(1)``) merges the head and position dims into one
-    reduction, which the device rejects: "More than one reduction dim is split
-    across cores".
-    """
-    if x.device.type == "spyre":
-        rows = torch.ops.spyre.quantscalepertokenfp8(x, rng)  # [B, n_kv, n, 1]
-    else:
-        rows = (x.abs().amax(dim=-1, keepdim=True) / rng).clamp(min=1e-5)
-    s = rows.amax(dim=2, keepdim=True)  # positions -> [B, n_kv, 1, 1]
-    s = s.amax(dim=1, keepdim=True)  # heads -> [B, 1, 1, 1]
-    return s.amax(dim=0, keepdim=True).to(SCALE_DTYPE)  # batch -> [1, 1, 1, 1]
-
-
 def _quantize(x, scale, kernel: bool):
     """E4M3 quantize: QFP8WT when ``kernel`` (a matmul mat2), else QFP8CH.
 
@@ -339,27 +337,18 @@ def _k_blocks(blocks, scale):
 
 
 def store_fp8_kv(attn, k, v, key_cache, value_cache, cache_index):
-    """Quantize ``k`` and ``v`` with the layer's scales and scatter them in.
+    """Quantize ``k`` and ``v`` with the layer's static scales and scatter them in.
 
     ``k``/``v`` are fp16 ``[B, n_kv, L, Dh]``; ``cache_index`` comes from
-    ``fp8_cache_index``. Prefill (``L > 1``) writes whole K blocks straight
-    from ``k``; decode (``L == 1``) adds the token to the staging block and
-    rewrites that block.
-
-    On the request's first store the scales are computed from these ``k``/``v``
-    and written into the layer's scale tensors; every later store reuses them.
-    ``attn._kv_scales_set`` is a plain bool, so Dynamo builds one graph for the
-    first store and one for the rest instead of branching at runtime. It is
-    flipped after prefill by ``freeze_kv_scales``.
+    ``fp8_cache_index``. Prefill (``L > 1``, the whole prompt or one chunk of
+    it) writes whole K blocks straight from ``k``; decode (``L == 1``) adds the
+    token to the staging block and rewrites that block.
 
     Writes in place and returns ``(key_cache, value_cache)``, like
     ``kv_cache_update``.
     """
     B, n_kv, L, Dh = k.shape
     k_blocks, k_slot, v_rows = cache_index
-    if not attn._kv_scales_set:
-        attn._k_scale.copy_(_per_tensor_scale(k, K_RANGE))
-        attn._v_scale.copy_(_per_tensor_scale(v, V_RANGE).reshape(1, 1, 1))
 
     if L == 1:
         staging = attn._k_staging  # [64, B, n_kv, Dh]
@@ -402,21 +391,22 @@ def _dequantize(x_fp8, scale):
     return (x_fp8.float() * scale.float()).to(scale.dtype)
 
 
-def _quantize_q_decode(q_f):
-    """Decode Q -> E4M3 QFP8CH with a unit scale: clamp, then convert.
+def _quantize_q(q_f, scale: float):
+    """Q -> E4M3 QFP8CH with a static scale: ``q / scale``, clamp, convert.
 
-    TODO(torch-spyre): use the per-token scale here too, as prefill does. At
+    One-input ops only (a multiply by a constant, clamp, ``qfp8ch``). At
     L == 1, Q (RoPE's output seen through flatten(3)/transpose(1, 2), plus the
     GQA fold) composes into a 6D view, and any two-input pointwise op on it --
-    quantize_fp8_with_scale's ``q * (1/scale)`` -- fails layout propagation
-    (_project_pointwise_dim_order adds one leading axis too many when the
-    output order ends in the sparse-stick marker; AssertionError in
-    _is_supported_pointwise_layout). clamp and qfp8ch each have one input.
+    such as quantize_fp8_with_scale's ``q * (1/scale)`` with a scale tensor --
+    fails layout propagation (_project_pointwise_dim_order adds one leading
+    axis too many when the output order ends in the sparse-stick marker;
+    AssertionError in _is_supported_pointwise_layout).
 
-    A unit scale is torch-spyre#5178's ``per_tensor_amax`` scheme. E4M3 keeps
-    3 mantissa bits for any |q| in [2^-6, 448], so only values outside that
-    range lose precision (clamped above, subnormal below).
+    E4M3 keeps 3 mantissa bits for any |q / scale| in [2^-6, 448], so only
+    values outside that range lose precision (clamped above, subnormal below).
     """
+    if scale != 1.0:
+        q_f = q_f * (1.0 / scale)
     if q_f.device.type == "spyre":
         return torch.ops.spyre.qfp8ch(q_f.clamp(-FP8_MAX, FP8_MAX))
     return q_f.float().clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
@@ -436,21 +426,13 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
     M = n_blocks * KV_BLOCK
     gL = n_q // n_kv * L
 
+    q_s, k_s, _v_s = attn._fp8_scales
+
     # GQA fold: [B, n_kv, g*L, Dh].
     q_f = q.reshape(B, n_kv, gL, Dh)
-    # Quantize the folded Q once, then repeat the FP8 rows over the blocks.
-    # Neither the per-token scale nor quantize may read a repeated (broadcast)
-    # view on device: each failed in dbo-opt. The scale is applied to the
-    # scores instead.
-    if L == 1:
-        s_f = None
-        q_fp8 = _quantize_q_decode(q_f)
-    else:
-        if q_f.device.type == "spyre":
-            s_f = torch.ops.spyre.quantscalepertokenfp8(q_f, FP8_MAX)
-        else:
-            s_f = (q_f.abs().amax(dim=-1, keepdim=True) / FP8_MAX).clamp(min=1e-4)
-        q_fp8 = _quantize(q_f, s_f, kernel=False)  # QFP8CH, mat1
+    # Quantize the folded Q once, then repeat the FP8 rows over the blocks:
+    # quantize may not read a repeated (broadcast) view on device (dbo-opt).
+    q_fp8 = _quantize_q(q_f, q_s)  # QFP8CH, mat1
 
     # One copy per K block: [B*NB, n_kv, g*L, Dh].
     if B == 1:
@@ -466,20 +448,8 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
         )
 
     raw = _scaled_bmm(q_fp8, key_cache, out_dtype=q.dtype)  # [B*NB, n_kv, g*L, 64]
-    # Scale in the block domain. With B == 1 the folded Q scale
-    # [1, n_kv, g*L, 1] broadcasts over the blocks as is.
-    if s_f is None:
-        s_q = 1.0  # decode: Q was quantized with a unit scale
-    elif B == 1:
-        s_q = s_f
-    else:
-        # TODO: B > 1 repeats the scale through a 5D view; untested on device.
-        s_q = (
-            s_f.unsqueeze(1)
-            .expand(B, n_blocks, n_kv, gL, 1)
-            .reshape(B * n_blocks, n_kv, gL, 1)
-        )
-    scores = (raw * s_q * attn._k_scale * attn.scaling).to(q.dtype)
+    # Static scales: one constant rescale, in the block domain.
+    scores = (raw * (q_s * k_s * attn.scaling)).to(q.dtype)
     v = _dequantize(value_cache, attn._v_scale)  # fp16 [B*M, n_kv, Dh]
 
     if B == 1 and L == 1:
@@ -544,9 +514,8 @@ def fp8_qk_attention(attn, q, key_cache, value_cache, attn_mask):
     """``softmax(Q · Kᵀ · scale + mask) · V`` with only ``Q · Kᵀ`` in FP8.
 
     For the ordinary fp16 KV cache (``[B, n_kv, M, Dh]``, written by
-    ``kv_cache_update``): nothing is stored in FP8. Each call quantizes Q (as
-    ``fp8_attention`` does: per-token at prefill, unit scale at decode) and
-    the whole K cache, transposed, with a unit scale, then runs one
+    ``kv_cache_update``): nothing is stored in FP8. Each call quantizes Q and
+    the whole K cache, transposed, with unit scales, then runs one
     ``scaled_bmm`` over all positions; softmax and ``A · V`` stay fp16 on the
     V cache as is. Batch dims match, so there is no per-tile repeat.
     Returns fp16 ``[B, n_q, L, Dh]``, like SDPA.
@@ -556,19 +525,11 @@ def fp8_qk_attention(attn, q, key_cache, value_cache, attn_mask):
     gL = n_q // n_kv * L
 
     q_f = q.reshape(B, n_kv, gL, Dh)  # GQA fold
-    if L == 1:
-        s_q = None
-        q_fp8 = _quantize_q_decode(q_f)
-    else:
-        if q_f.device.type == "spyre":
-            s_q = torch.ops.spyre.quantscalepertokenfp8(q_f, FP8_MAX)
-        else:
-            s_q = (q_f.abs().amax(dim=-1, keepdim=True) / FP8_MAX).clamp(min=1e-4)
-        q_fp8 = _quantize(q_f, s_q, kernel=False)  # QFP8CH, mat1
+    q_fp8 = _quantize_q(q_f, DEFAULT_SCALE)  # QFP8CH, mat1
 
     k_fp8 = _quantize_k_unit(key_cache.transpose(-2, -1).contiguous())  # mat2
     raw = _scaled_bmm(q_fp8, k_fp8, out_dtype=q.dtype)  # [B, n_kv, g*L, M]
-    scores = raw * attn.scaling if s_q is None else raw * s_q * attn.scaling
+    scores = raw * attn.scaling
     scores = scores.to(q.dtype).reshape(B, n_q, L, M)  # (kv, g) -> q head
     if attn_mask is not None:
         scores = scores + attn_mask.clamp(min=MASK_FLOOR)
