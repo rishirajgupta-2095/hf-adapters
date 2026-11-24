@@ -32,7 +32,7 @@ import types
 
 import torch
 
-from hf_adapters.fp8_kv import fp8_qk_attention
+from hf_adapters.fp8_kv import fp8_qk_attention, prefill_chunk_size
 from hf_adapters.fp8_linear import swap_linears_to_fp8
 from hf_adapters.hf_common import (
     _SDPA_MAX_SEQUENCE_TILE_SIZE,
@@ -143,4 +143,10 @@ def prepare_for_spyre(model):
     # Chunked prefill for every path. The FP8 KV cache has no [B, n_kv, :L, Dh]
     # slice, so its allocator asks generate() for whole caches instead
     # (``_spyre_prefill_full_cache``); its static scales keep chunks consistent.
-    model._spyre_prefill_chunk_size = _SDPA_MAX_SEQUENCE_TILE_SIZE
+    chunk = _SDPA_MAX_SEQUENCE_TILE_SIZE
+    if getattr(model, "_spyre_fp8_kv_cache", False):
+        # TODO: drop once prefill attention walks the K blocks with an online
+        # softmax; see fp8_kv.prefill_chunk_size for why long prompts need it.
+        chunk = prefill_chunk_size(chunk)
+        print(f"FP8: prefill chunk {chunk} with the FP8 KV cache")
+    model._spyre_prefill_chunk_size = chunk

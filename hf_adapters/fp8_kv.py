@@ -75,6 +75,7 @@ attention modules instead.
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 
@@ -82,6 +83,7 @@ from .fp8_linear import FP8_DTYPE, FP8_MAX
 
 KV_BLOCK = 64  # positions per K block: the N extent of one QFP8WT stick
 DEFAULT_SCALE = 1.0  # static Q/K/V scale when the checkpoint ships none
+PREFILL_CHUNK_ENV = "FP8_KV_PREFILL_CHUNK"
 SCALE_DTYPE = torch.float16  # dequantize_fp8_with_scale requires an fp16 scale
 STAGING_DTYPE = torch.float16  # FP8Linear outputs fp16
 
@@ -92,6 +94,39 @@ STAGING_DTYPE = torch.float16  # FP8Linear outputs fp16
 # unaffected; a fully masked row gets uniform weights and a finite output that
 # is never read.
 MASK_FLOOR = -1.0e4
+
+
+def prefill_chunk_size(default: int) -> int:
+    """Prefill chunk size with the FP8 KV cache: ``$FP8_KV_PREFILL_CHUNK`` or ``default``.
+
+    Each prefill chunk scores its queries against every K block of the cache in
+    one ``scaled_bmm``, so the score tensor ``[NB, n_kv, g * chunk, 64]`` grows
+    with cache length times chunk size. Spyre caps one tensor's per-core span at
+    256 MB, which Granite 3.3 8B (n_kv 8, g 4, fp16 scores) exceeds at chunk 512
+    from an 8K prompt on (136 blocks: 272 MB). Until prefill attention walks the
+    blocks with an online softmax, a smaller chunk keeps it under the limit:
+
+        prompt   K blocks   largest chunk that fits
+        4K        72        512
+        8K       136        256
+        16K      264        128
+        32K      520         64
+
+    Decode is not affected: its scores are [NB, n_kv, g, 64]. The chunk must be
+    a positive multiple of the 64-position K block.
+    """
+    raw = os.environ.get(PREFILL_CHUNK_ENV)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        chunk = int(raw)
+    except ValueError:
+        raise ValueError(f"{PREFILL_CHUNK_ENV}={raw!r} is not an integer") from None
+    if chunk <= 0 or chunk % KV_BLOCK:
+        raise ValueError(
+            f"{PREFILL_CHUNK_ENV}={chunk} must be a positive multiple of {KV_BLOCK}"
+        )
+    return chunk
 
 
 # ---------------------------------------------------------------------------

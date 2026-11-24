@@ -35,6 +35,7 @@ from hf_adapters.fp8_kv import (
     fp8_attention,
     fp8_cache_index,
     fp8_qk_attention,
+    prefill_chunk_size,
     store_fp8_kv,
 )
 
@@ -276,3 +277,17 @@ def test_fp8_qk_attention_on_fp16_cache(b):
         kc[:, :, sl], vc[:, :, sl] = k[:, :, sl], v[:, :, sl]
         got = fp8_qk_attention(attn, q[:, :, sl], kc, vc, _mask(pos, 1, m))
         assert _cos(got, _ref(q[:, :, sl], k, v, pos, m)) > 0.995, pos
+
+
+def test_prefill_chunk_size_from_env(monkeypatch):
+    """FP8_KV_PREFILL_CHUNK overrides the chunk; it must be a multiple of 64."""
+    monkeypatch.delenv("FP8_KV_PREFILL_CHUNK", raising=False)
+    assert prefill_chunk_size(512) == 512
+    monkeypatch.setenv("FP8_KV_PREFILL_CHUNK", "")
+    assert prefill_chunk_size(512) == 512
+    monkeypatch.setenv("FP8_KV_PREFILL_CHUNK", "64")
+    assert prefill_chunk_size(512) == 64
+    for bad in ("0", "96", "-64", "abc"):
+        monkeypatch.setenv("FP8_KV_PREFILL_CHUNK", bad)
+        with pytest.raises(ValueError):
+            prefill_chunk_size(512)

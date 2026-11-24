@@ -110,3 +110,26 @@ def test_chunked_prefill_with_fp8_kv(granite, b):
     # top-2 margin of 0.0015 in a random tiny model).
     assert _cos(chunked.logits[0], fp16_kv.logits[0]) > 0.999
     assert torch.isfinite(torch.stack(chunked.logits)).all()
+
+
+@pytest.mark.parametrize("fp8_kv", [True, False])
+def test_granite_prefill_chunk_override_is_fp8_kv_only(monkeypatch, fp8_kv):
+    """FP8_KV_PREFILL_CHUNK sets the chunk only with the FP8 KV cache; the fp16
+    paths keep SDPA's 512."""
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
+    monkeypatch.setenv("FP8_KV_PREFILL_CHUNK", "128")
+    config = GraniteConfig(
+        vocab_size=129,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        logits_scaling=2.0,
+        pad_token_id=0,
+    )
+    model = AutoModelForCausalLM.from_config(config).eval().half()
+    # Set by prepare_for_spyre for an FP8 checkpoint with FP8_KV_CACHE=1.
+    model._spyre_fp8_kv_cache = fp8_kv
+    importlib.import_module("hf_adapters.hf_granite").prepare_for_spyre(model)
+    assert model._spyre_prefill_chunk_size == (128 if fp8_kv else 512)
