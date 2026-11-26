@@ -32,6 +32,7 @@ from hf_adapters.fp8_kv import (
     KV_BLOCK,
     _static_scale,
     block_decode_mask,
+    decode_group_blocks,
     fp8_attention,
     fp8_cache_index,
     fp8_qk_attention,
@@ -291,3 +292,43 @@ def test_prefill_chunk_size_from_env(monkeypatch):
         monkeypatch.setenv("FP8_KV_PREFILL_CHUNK", bad)
         with pytest.raises(ValueError):
             prefill_chunk_size(512)
+
+
+def test_decode_group_blocks_default_and_env(monkeypatch):
+    """Default group keeps one group's scores at 1 MiB; the env var overrides."""
+    monkeypatch.delenv("FP8_KV_DECODE_GROUP", raising=False)
+    assert decode_group_blocks(8, 4) == 256  # Granite 3.3 8B: 256 x 4 KiB
+    assert decode_group_blocks(N_KV, N_Q // N_KV) == 1024
+    monkeypatch.setenv("FP8_KV_DECODE_GROUP", "3")
+    assert decode_group_blocks(8, 4) == 3
+    for bad in ("0", "-2", "x"):
+        monkeypatch.setenv("FP8_KV_DECODE_GROUP", bad)
+        with pytest.raises(ValueError):
+            decode_group_blocks(8, 4)
+
+
+@pytest.mark.parametrize("group", ["1", "2", "3"])
+def test_grouped_decode_matches_one_group(monkeypatch, group):
+    """Decode over groups of K blocks (online softmax, uneven last group) gives
+    the same output as one group over the whole cache, and tracks fp32."""
+    pre, m = 192, 320  # 5 K blocks; decode at positions 192..195 (block 3)
+    q, k, v = _qkv(1, pre + 4, seed=21)
+    outs = {}
+    for g in ("1000", group):
+        monkeypatch.setenv("FP8_KV_DECODE_GROUP", g)
+        attn, kc, vc = _state(1, m)
+        store_fp8_kv(
+            attn, k[:, :, :pre], v[:, :, :pre], kc, vc, fp8_cache_index(1, m, 0, pre)
+        )
+        got = []
+        for pos in range(pre, pre + 4):
+            sl = slice(pos, pos + 1)
+            store_fp8_kv(
+                attn, k[:, :, sl], v[:, :, sl], kc, vc, fp8_cache_index(1, m, pos, 1)
+            )
+            mask = block_decode_mask(_mask(pos, 1, m))
+            got.append(fp8_attention(attn, q[:, :, sl], kc, vc, mask))
+        outs[g] = got
+    for pos, (one, grouped) in enumerate(zip(outs["1000"], outs[group]), start=pre):
+        torch.testing.assert_close(grouped.float(), one.float(), rtol=2e-3, atol=2e-3)
+        assert _cos(grouped, _ref(q[:, :, pos : pos + 1], k, v, pos, m)) > 0.995

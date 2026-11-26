@@ -65,7 +65,9 @@ against 8 KV heads. Instead of repeating K and V four times over (FMS's
 the row dim: ``[B, 32, L, Dh] -> [B, 8, 4L, Dh]``. Exact, because those heads
 all multiply the same K, and a single reshape since the heads are KV-major. The
 folded Q is then repeated over the ``NB`` blocks so one ``scaled_bmm`` scores
-every block, and softmax runs over all ``M`` positions at once.
+every block, and softmax runs over all ``M`` positions at once. Decode
+(B == 1) does the same per group of blocks and combines the groups with an
+online softmax, so no tensor spans the whole cache (``_decode_in_groups``).
 
 Nothing here is imported by ``hf_common`` at module load: ``hf_common`` must
 not import from its own package. ``attach_fp8_kv`` hands these functions to the
@@ -84,6 +86,11 @@ from .fp8_linear import FP8_DTYPE, FP8_MAX
 KV_BLOCK = 64  # positions per K block: the N extent of one QFP8WT stick
 DEFAULT_SCALE = 1.0  # static Q/K/V scale when the checkpoint ships none
 PREFILL_CHUNK_ENV = "FP8_KV_PREFILL_CHUNK"
+DECODE_GROUP_ENV = "FP8_KV_DECODE_GROUP"
+# Decode works on groups of K blocks whose score tensor stays this size or
+# smaller (see decode_group_blocks): 1 MiB, under the 1,625,344 B per-core LX
+# budget torch-spyre plans against.
+DECODE_GROUP_SCORE_BYTES = 1 << 20
 SCALE_DTYPE = torch.float16  # dequantize_fp8_with_scale requires an fp16 scale
 STAGING_DTYPE = torch.float16  # FP8Linear outputs fp16
 
@@ -127,6 +134,30 @@ def prefill_chunk_size(default: int) -> int:
             f"{PREFILL_CHUNK_ENV}={chunk} must be a positive multiple of {KV_BLOCK}"
         )
     return chunk
+
+
+def decode_group_blocks(n_kv: int, g: int) -> int:
+    """K blocks per decode group: ``$FP8_KV_DECODE_GROUP``, else what keeps one
+    group's scores ``[G, n_kv, g, 64]`` (fp16) within ``DECODE_GROUP_SCORE_BYTES``.
+
+    Decode scores every K block of the cache. Held as one ``[NB, n_kv, g, 64]``
+    tensor, they fit a core's LX scratchpad only up to a size: for Granite 3.3
+    8B (n_kv 8, g 4) that is 396 blocks (1,622,016 B against a 1,625,344 B
+    budget); at 397 the fused decode kernel takes another plan and runs 5.6x
+    slower (measured: 1.80 -> 10.0 ms per layer). Working on groups of blocks
+    and combining them with an online softmax keeps every group's scores small
+    at any cache length. Granite: 256 blocks per group (1 MiB).
+    """
+    raw = os.environ.get(DECODE_GROUP_ENV)
+    if raw is not None and raw.strip() != "":
+        try:
+            group = int(raw)
+        except ValueError:
+            raise ValueError(f"{DECODE_GROUP_ENV}={raw!r} is not an integer") from None
+        if group <= 0:
+            raise ValueError(f"{DECODE_GROUP_ENV}={group} must be positive")
+        return group
+    return max(1, DECODE_GROUP_SCORE_BYTES // (n_kv * g * KV_BLOCK * 2))
 
 
 # ---------------------------------------------------------------------------
@@ -290,8 +321,8 @@ def attach_fp8_kv(model, shapes, batch_size, device) -> int:
 def block_decode_mask(mask):
     """Host-side decode mask ``[1, 1 or n_q, 1, M]`` -> ``[NB, 1, 1, 64]``.
 
-    The B == 1 decode path (``_decode_in_blocks``) adds the mask to scores
-    shaped ``[NB, n_kv, g, 64]``. Splitting ``M`` into ``NB x 64`` would reshape
+    The B == 1 decode path (``_decode_in_groups``) adds the mask, a group of
+    blocks at a time, to scores shaped ``[G, n_kv, g, 64]``. Splitting ``M`` into ``NB x 64`` would reshape
     the stick dim, which a view on device may not do, so it is done here, on
     the CPU mask, before it is moved. Every head shares the decode mask, so
     head 0's row is enough.
@@ -469,6 +500,9 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
     # quantize may not read a repeated (broadcast) view on device (dbo-opt).
     q_fp8 = _quantize_q(q_f, q_s)  # QFP8CH, mat1
 
+    if B == 1 and L == 1:
+        return _decode_in_groups(attn, q_fp8, key_cache, value_cache, attn_mask, n_q)
+
     # One copy per K block: [B*NB, n_kv, g*L, Dh].
     if B == 1:
         # A plain 4D broadcast of the size-1 batch dim, without the general
@@ -487,9 +521,6 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
     scores = (raw * (q_s * k_s * attn.scaling)).to(q.dtype)
     v = _dequantize(value_cache, attn._v_scale)  # fp16 [B*M, n_kv, Dh]
 
-    if B == 1 and L == 1:
-        return _decode_in_blocks(scores, v, attn_mask, n_q)
-
     # Blocks back into positions; heads are KV-major, so (kv, g) -> q head.
     scores = scores.reshape(B, n_blocks, n_kv, gL, KV_BLOCK).permute(0, 2, 3, 1, 4)
     scores = scores.reshape(B, n_q, L, M)
@@ -502,31 +533,59 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
     return out.reshape(B, n_q, L, -1)
 
 
-def _decode_in_blocks(scores, v, attn_mask, n_q):
-    """Decode (B == 1, L == 1) softmax and A·V without leaving the block domain.
+def _decode_in_groups(attn, q_fp8, key_cache, value_cache, attn_mask, n_q):
+    """Decode (B == 1, L == 1) attention over groups of K blocks, online softmax.
 
-    ``scores`` ``[NB, n_kv, g, 64]`` (scaled); ``v`` fp16 ``[M, n_kv, Dh]``;
-    ``attn_mask`` ``[NB, 1, 1, 64]``, already in blocks (``block_decode_mask``).
-    Returns ``[1, n_q, 1, Dh]``.
+    ``q_fp8`` ``[1, n_kv, g, Dh]`` (QFP8CH, folded); caches as in the module
+    docstring; ``attn_mask`` ``[NB, 1, 1, 64]``, already in blocks
+    (``block_decode_mask``). Returns ``[1, n_q, 1, Dh]``.
 
-    Exactly ``softmax`` over all ``M = NB*64`` positions followed by ``A·V``,
-    but the scores are never permuted back to ``[1, n_q, 1, M]``: at L == 1 any
-    multi-input op that reads that permuted view has no device layout (the
-    view decomposes into 6D). The max and the sum are taken over the 64
-    positions and then over the blocks, one dim at a time, and ``A·V`` runs per
-    block and is summed over the blocks.
+    Exactly ``softmax`` over all ``M = NB*64`` positions followed by ``A·V``.
+    The K blocks are taken ``decode_group_blocks`` at a time; each group runs
+    Q·Kᵀ on the FP8 engine, its mask, its max and sum over 64 positions then
+    over its blocks, and ``A·V`` on just its V rows (dequantized per group),
+    giving a running ``(max, sum, output)``. The groups are then combined:
+    ``m = max m_g``, ``l = sum l_g * exp(m_g - m)``,
+    ``out = sum o_g * exp(m_g - m) / l``. No tensor ever spans all NB blocks,
+    so the per-core working set stays bounded (see ``decode_group_blocks``).
+
+    Everything stays in the block domain: the scores are never permuted back to
+    ``[1, n_q, 1, M]``, which at L == 1 is a view (6D) with no device layout.
     """
-    n_blocks, n_kv = scores.shape[:2]
-    if attn_mask is not None:
-        scores = scores + attn_mask.clamp(min=MASK_FLOOR)
-    m = scores.amax(dim=-1, keepdim=True).amax(dim=0, keepdim=True)  # [1, n_kv, g, 1]
-    e = torch.exp(scores - m)
-    denom = e.sum(dim=-1, keepdim=True).sum(dim=0, keepdim=True)  # [1, n_kv, g, 1]
+    _, n_kv, g, Dh = q_fp8.shape
+    n_blocks = key_cache.shape[0]
+    q_s, k_s, _v_s = attn._fp8_scales
+    scale = q_s * k_s * attn.scaling
+    group = decode_group_blocks(n_kv, g)
 
-    # [M, n_kv, Dh] -> [NB, n_kv, 64, Dh]
-    v_blk = v.reshape(n_blocks, KV_BLOCK, n_kv, -1).permute(0, 2, 1, 3)
-    out = torch.matmul(e, v_blk).sum(dim=0, keepdim=True) / denom  # [1, n_kv, g, Dh]
-    return out.reshape(1, n_q, 1, -1)
+    parts = []
+    for b0 in range(0, n_blocks, group):
+        b1 = min(b0 + group, n_blocks)
+        nb = b1 - b0
+        raw = _scaled_bmm(  # [nb, n_kv, g, 64]
+            q_fp8.expand(nb, n_kv, g, Dh), key_cache[b0:b1], out_dtype=torch.float16
+        )
+        s = (raw * scale).to(torch.float16)
+        if attn_mask is not None:
+            s = s + attn_mask[b0:b1].clamp(min=MASK_FLOOR)
+        m = s.amax(dim=-1, keepdim=True).amax(dim=0, keepdim=True)  # [1, n_kv, g, 1]
+        e = torch.exp(s - m)
+        l_sum = e.sum(dim=-1, keepdim=True).sum(dim=0, keepdim=True)  # [1, n_kv, g, 1]
+        # This group's V rows only: [nb*64, n_kv, Dh] -> [nb, n_kv, 64, Dh].
+        v = _dequantize(value_cache[b0 * KV_BLOCK : b1 * KV_BLOCK], attn._v_scale)
+        v_blk = v.reshape(nb, KV_BLOCK, n_kv, -1).permute(0, 2, 1, 3)
+        o = torch.matmul(e, v_blk).sum(dim=0, keepdim=True)  # [1, n_kv, g, Dh]
+        parts.append((m, l_sum, o))
+
+    m_all = parts[0][0]
+    for m_g, _, _ in parts[1:]:
+        m_all = torch.maximum(m_all, m_g)
+    l_all = o_all = None
+    for m_g, l_g, o_g in parts:
+        w = torch.exp(m_g - m_all)  # 1 for a group holding the overall max
+        l_all = l_g * w if l_all is None else l_all + l_g * w
+        o_all = o_g * w if o_all is None else o_all + o_g * w
+    return (o_all / l_all).reshape(1, n_q, 1, -1)
 
 
 # ---------------------------------------------------------------------------
