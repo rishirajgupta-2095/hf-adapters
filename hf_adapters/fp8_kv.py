@@ -568,7 +568,6 @@ def _decode_in_groups(attn, q_fp8, key_cache, value_cache, attn_mask, n_q):
     if attn_mask is not None:
         scores = scores + attn_mask.clamp(min=MASK_FLOOR)
     v = _dequantize(value_cache, attn._v_scale)  # fp16 [M, n_kv, Dh]
-    v_blk = v.reshape(n_blocks, KV_BLOCK, n_kv, -1).permute(0, 2, 1, 3)
 
     parts = []
     for b0 in range(0, n_blocks, group):
@@ -577,7 +576,12 @@ def _decode_in_groups(attn, q_fp8, key_cache, value_cache, attn_mask, n_q):
         m = s.amax(dim=-1, keepdim=True).amax(dim=0, keepdim=True)  # [1, n_kv, g, 1]
         e = torch.exp(s - m)
         l_sum = e.sum(dim=-1, keepdim=True).sum(dim=0, keepdim=True)  # [1, n_kv, g, 1]
-        o = torch.matmul(e, v_blk[b0:b1]).sum(dim=0, keepdim=True)  # [1, n_kv, g, Dh]
+        # Slice V on its contiguous row dim, then view it as blocks: a slice of
+        # the permuted [NB, n_kv, 64, Dh] view stops dbo-opt ("unhandled
+        # operation" in Sentient/Analyses/Utils.cpp).
+        v_g = v[b0 * KV_BLOCK : b1 * KV_BLOCK]
+        v_blk = v_g.reshape(b1 - b0, KV_BLOCK, n_kv, -1).permute(0, 2, 1, 3)
+        o = torch.matmul(e, v_blk).sum(dim=0, keepdim=True)  # [1, n_kv, g, Dh]
         parts.append((m, l_sum, o))
 
     m_all = parts[0][0]
