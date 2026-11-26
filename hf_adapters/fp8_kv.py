@@ -66,8 +66,8 @@ the row dim: ``[B, 32, L, Dh] -> [B, 8, 4L, Dh]``. Exact, because those heads
 all multiply the same K, and a single reshape since the heads are KV-major. The
 folded Q is then repeated over the ``NB`` blocks so one ``scaled_bmm`` scores
 every block, and softmax runs over all ``M`` positions at once. Decode
-(B == 1) does the same per group of blocks and combines the groups with an
-online softmax, so no tensor spans the whole cache (``_decode_in_groups``).
+(B == 1) then takes the softmax and A·V a group of blocks at a time and
+combines the groups with an online softmax (``_decode_in_groups``).
 
 Nothing here is imported by ``hf_common`` at module load: ``hf_common`` must
 not import from its own package. ``attach_fp8_kv`` hands these functions to the
@@ -248,7 +248,7 @@ def allocate_fp8_kv_caches(model, shapes, batch_size, max_cache_len, device):
         for (n_kv, _hd, vhd) in shapes
     ]
 
-    n = attach_fp8_kv(model, shapes, batch_size, device, n_blocks=n_blocks)
+    n = attach_fp8_kv(model, shapes, batch_size, device)
     if n != len(shapes):
         raise RuntimeError(
             f"FP8 KV cache: wired {n} attention module(s) but allocated "
@@ -288,32 +288,13 @@ def _static_scale(attn, name) -> float:
     return value
 
 
-def _decode_groups(n_blocks, group, device):
-    """``[(block_index, row_index), ...]`` for each decode group of K blocks, or
-    ``[]`` when one group covers the whole cache (read it whole, no gather).
-
-    The indices are built on the host and moved once: decode gathers each
-    group's K blocks, V rows and mask blocks with ``index_select`` on dim 0.
-    """
-    if n_blocks <= group:
-        return []
-    groups = []
-    for b0 in range(0, n_blocks, group):
-        b1 = min(b0 + group, n_blocks)
-        blk = torch.arange(b0, b1, dtype=torch.long)
-        row = torch.arange(b0 * KV_BLOCK, b1 * KV_BLOCK, dtype=torch.long)
-        groups.append((blk.to(device), row.to(device)))
-    return groups
-
-
-def attach_fp8_kv(model, shapes, batch_size, device, n_blocks=None) -> int:
+def attach_fp8_kv(model, shapes, batch_size, device) -> int:
     """Turn the FP8 KV path on in every attention module, with fresh state.
 
     Sets the layer's static scales (``_fp8_scales`` as floats for Q and the
     score rescale; ``_k_scale`` / ``_v_scale`` as fp16 tensors for the K/V
-    quantize and the V dequantize), a zeroed K staging block, and for B == 1
-    the decode groups' gather indices (``_decode_groups``). Returns the number
-    of modules wired up.
+    quantize and the V dequantize) and a zeroed K staging block. Returns the
+    number of modules wired up.
     """
     attns = [
         attn
@@ -332,12 +313,6 @@ def attach_fp8_kv(model, shapes, batch_size, device, n_blocks=None) -> int:
         attn._k_staging = torch.zeros(
             (KV_BLOCK, batch_size, n_kv, hd), dtype=STAGING_DTYPE, device=device
         )
-        attn._decode_groups = None
-        if batch_size == 1 and n_blocks is not None:
-            g = attn.q_proj.out_features // attn.head_dim // n_kv
-            attn._decode_groups = _decode_groups(
-                n_blocks, decode_group_blocks(n_kv, g), device
-            )
         attn._fp8_store = store_fp8_kv
         attn._fp8_attention = fp8_attention
     return len(attns)
@@ -558,29 +533,25 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
     return out.reshape(B, n_q, L, -1)
 
 
-def _gather(x, index):
-    """``x.index_select(0, index)``; CPU has no FP8 kernel, so FP8 goes as bytes."""
-    if x.device.type != "spyre" and x.dtype == FP8_DTYPE:
-        return x.view(torch.uint8).index_select(0, index).view(FP8_DTYPE)
-    return x.index_select(0, index)
-
-
 def _decode_in_groups(attn, q_fp8, key_cache, value_cache, attn_mask, n_q):
-    """Decode (B == 1, L == 1) attention over groups of K blocks, online softmax.
+    """Decode (B == 1, L == 1) softmax and A·V over groups of K blocks, online softmax.
 
     ``q_fp8`` ``[1, n_kv, g, Dh]`` (QFP8CH, folded); caches as in the module
     docstring; ``attn_mask`` ``[NB, 1, 1, 64]``, already in blocks
     (``block_decode_mask``). Returns ``[1, n_q, 1, Dh]``.
 
     Exactly ``softmax`` over all ``M = NB*64`` positions followed by ``A·V``.
-    The K blocks are taken ``decode_group_blocks`` at a time (gathered with
-    ``index_select``, never sliced; one group reads the caches whole); each group runs
-    Q·Kᵀ on the FP8 engine, its mask, its max and sum over 64 positions then
-    over its blocks, and ``A·V`` on just its V rows (dequantized per group),
-    giving a running ``(max, sum, output)``. The groups are then combined:
-    ``m = max m_g``, ``l = sum l_g * exp(m_g - m)``,
-    ``out = sum o_g * exp(m_g - m) / l``. No tensor ever spans all NB blocks,
-    so the per-core working set stays bounded (see ``decode_group_blocks``).
+    Q·Kᵀ runs once over the whole K cache and V is dequantized whole, both read
+    straight from the caches: ``store_fp8_kv`` has just written them in place
+    in this same compiled graph, and on Spyre a view of them (even a
+    full-range slice) reads the pre-store contents, while ``index_select`` on
+    them does not compile. Only computed tensors are split: the scores and the
+    dequantized V are taken ``decode_group_blocks`` blocks at a time, and each
+    group's max and sum (over 64 positions, then its blocks) and ``A·V`` give a
+    running ``(max, sum, output)``, combined as ``m = max m_g``,
+    ``l = sum l_g * exp(m_g - m)``, ``out = sum o_g * exp(m_g - m) / l``. The
+    reductions that hold the scores together never span more than one group
+    (see ``decode_group_blocks``).
 
     Everything stays in the block domain: the scores are never permuted back to
     ``[1, n_q, 1, M]``, which at L == 1 is a view (6D) with no device layout.
@@ -588,45 +559,25 @@ def _decode_in_groups(attn, q_fp8, key_cache, value_cache, attn_mask, n_q):
     _, n_kv, g, Dh = q_fp8.shape
     n_blocks = key_cache.shape[0]
     q_s, k_s, _v_s = attn._fp8_scales
-    scale = q_s * k_s * attn.scaling
-    groups = getattr(attn, "_decode_groups", None)
-    if groups is None:  # not attached (CPU tests): build them here
-        groups = _decode_groups(
-            n_blocks, decode_group_blocks(n_kv, g), key_cache.device
-        )
+    group = decode_group_blocks(n_kv, g)
 
-    # Never slice the caches here: the store has just written them in place in
-    # this same compiled graph, and on Spyre a view of them (even a full-range
-    # slice) read the pre-store contents, so decode lost its newest tokens.
-    # One group reads the tensors whole; several gather with index_select.
-    if not groups:
-        inputs = [(key_cache, value_cache, attn_mask, n_blocks)]
-    else:
-        inputs = [
-            (
-                _gather(key_cache, blk),
-                _gather(value_cache, row),
-                None if attn_mask is None else _gather(attn_mask, blk),
-                blk.shape[0],
-            )
-            for blk, row in groups
-        ]
+    raw = _scaled_bmm(  # [NB, n_kv, g, 64]
+        q_fp8.expand(n_blocks, n_kv, g, Dh), key_cache, out_dtype=torch.float16
+    )
+    scores = (raw * (q_s * k_s * attn.scaling)).to(torch.float16)
+    if attn_mask is not None:
+        scores = scores + attn_mask.clamp(min=MASK_FLOOR)
+    v = _dequantize(value_cache, attn._v_scale)  # fp16 [M, n_kv, Dh]
+    v_blk = v.reshape(n_blocks, KV_BLOCK, n_kv, -1).permute(0, 2, 1, 3)
 
     parts = []
-    for k_g, v_g_fp8, mask_g, nb in inputs:
-        raw = _scaled_bmm(  # [nb, n_kv, g, 64]
-            q_fp8.expand(nb, n_kv, g, Dh), k_g, out_dtype=torch.float16
-        )
-        s = (raw * scale).to(torch.float16)
-        if mask_g is not None:
-            s = s + mask_g.clamp(min=MASK_FLOOR)
+    for b0 in range(0, n_blocks, group):
+        b1 = min(b0 + group, n_blocks)
+        s = scores[b0:b1]  # [nb, n_kv, g, 64]
         m = s.amax(dim=-1, keepdim=True).amax(dim=0, keepdim=True)  # [1, n_kv, g, 1]
         e = torch.exp(s - m)
         l_sum = e.sum(dim=-1, keepdim=True).sum(dim=0, keepdim=True)  # [1, n_kv, g, 1]
-        # This group's V rows: [nb*64, n_kv, Dh] -> [nb, n_kv, 64, Dh].
-        v = _dequantize(v_g_fp8, attn._v_scale)
-        v_blk = v.reshape(nb, KV_BLOCK, n_kv, -1).permute(0, 2, 1, 3)
-        o = torch.matmul(e, v_blk).sum(dim=0, keepdim=True)  # [1, n_kv, g, Dh]
+        o = torch.matmul(e, v_blk[b0:b1]).sum(dim=0, keepdim=True)  # [1, n_kv, g, Dh]
         parts.append((m, l_sum, o))
 
     m_all = parts[0][0]

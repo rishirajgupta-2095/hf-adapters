@@ -138,9 +138,8 @@ def test_granite_prefill_chunk_override_is_fp8_kv_only(monkeypatch, fp8_kv):
 @pytest.mark.parametrize("group", ["1", "2"])
 @torch.no_grad()
 def test_grouped_decode_in_generate(granite, monkeypatch, group):
-    """generate() with decode split into groups of K blocks (indices built by
-    attach_fp8_kv, gathered with index_select) decodes the same tokens as one
-    group over the whole cache."""
+    """generate() with decode split into groups of K blocks decodes the same
+    tokens as one group over the whole cache."""
     model, adapter = granite
     ids = torch.randint(1, 129, (1, PROMPT_LEN))
     monkeypatch.setenv("FP8_KV_DECODE_GROUP", "100000")
