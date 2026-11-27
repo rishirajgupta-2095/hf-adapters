@@ -39,6 +39,13 @@ def main():
         help="compare raw Q·Kᵀ per block (sliced K vs whole K) instead of outputs",
     )
     p.add_argument(
+        "--k-read",
+        nargs="+",
+        default=["slice"],
+        choices=sorted(K_READS),
+        help="how --scores reads a group of K blocks (several: one table each)",
+    )
+    p.add_argument(
         "--no-decode-store",
         dest="decode_store",
         action="store_false",
@@ -128,7 +135,9 @@ def main():
         return compile_(f)
 
     if a.scores:
-        return compare_k_scores(q, kc, nb_all, grp, compile_)
+        for how in a.k_read:
+            compare_k_scores(q, kc, nb_all, grp, compile_, how)
+        return
 
     ref = make(False, False, False)(q, kc, vc, mask).cpu().float()
     print(
@@ -149,7 +158,18 @@ def main():
         )
 
 
-def compare_k_scores(q, kc, nb_all, grp, compile_):
+# Ways --scores reads K blocks [b0, b1) as scaled_bmm's mat2:
+#   slice  kc[b0:b1], the view decode uses
+#   clone  a copy of that view, so scaled_bmm reads a fresh buffer at offset 0
+#   half   kc[b0//2 : b0//2 + n]: right data only if the slice offset is doubled
+K_READS = {
+    "slice": lambda kc, b0, b1: kc[b0:b1],
+    "clone": lambda kc, b0, b1: kc[b0:b1].clone(),
+    "half": lambda kc, b0, b1: kc[b0 // 2 : b0 // 2 + (b1 - b0)],
+}
+
+
+def compare_k_scores(q, kc, nb_all, grp, compile_, how="slice"):
     """Raw Q·Kᵀ per K block, from ``kc[b0:b1]`` per group vs one product over the
     whole cache. Outputs hide score errors (random data gives a flat softmax),
     so compare the scores themselves; for a wrong block, name the whole-cache
@@ -163,7 +183,7 @@ def compare_k_scores(q, kc, nb_all, grp, compile_):
         groups = [
             F._scaled_bmm(
                 q_fp8.expand(min(b0 + grp, nb_all) - b0, NKV, G, DH),
-                kc[b0 : min(b0 + grp, nb_all)],
+                K_READS[how](kc, b0, min(b0 + grp, nb_all)),
                 out_dtype=torch.float16,
             )
             for b0 in range(0, nb_all, grp)
@@ -173,8 +193,8 @@ def compare_k_scores(q, kc, nb_all, grp, compile_):
     whole, *groups = (t.cpu().float() for t in compile_(f)(q, kc))
     flat = whole.reshape(nb_all, -1)
     print(
-        f"raw Q·Kᵀ per block, {nb_all} K blocks of {BLK} positions in groups "
-        f"of {grp}, K cache {tuple(kc.shape)}"
+        f"raw Q·Kᵀ per block, K read by {how}: {nb_all} K blocks of {BLK} "
+        f"positions in groups of {grp}, K cache {tuple(kc.shape)}"
     )
     for gi, raw in enumerate(groups):
         b0 = gi * grp
