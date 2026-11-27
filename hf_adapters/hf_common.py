@@ -3579,6 +3579,21 @@ def generate(
 # ---------------------------------------------------------------------------
 
 
+def _fp8_decode_graph_break(attn, q):
+    """End the compiled graph between the KV store and attention for FP8 KV decode
+    that reads the caches in groups (``attn._fp8_split_decode``, set per request
+    by ``fp8_kv.attach_fp8_kv``).
+
+    The store writes the caches in place; in the same graph, slices of them read
+    the pre-store contents on Spyre. After a graph break the attention graph
+    receives the updated caches as inputs it does not write, so per-group slices
+    read correctly. Decided at trace time (a plain bool and a static shape), so
+    prefill and single-group decode keep one graph.
+    """
+    if getattr(attn, "_fp8_split_decode", False) and q.shape[2] == 1:
+        torch._dynamo.graph_break()
+
+
 class StandardGQAAttention(nn.Module):
     """Standard GQA attention split into projection and attention regions."""
 
@@ -3605,6 +3620,10 @@ class StandardGQAAttention(nn.Module):
         self._fp8_store = None
         self._fp8_attention = None
         self._fp8_scales = None
+        # FP8 KV decode over several groups of K blocks reads the caches per
+        # group; it needs the store and the attention in separate graphs
+        # (see _fp8_decode_graph_break).
+        self._fp8_split_decode = False
         self._k_scale = None
         self._v_scale = None
 
@@ -3687,6 +3706,7 @@ class StandardGQAAttention(nn.Module):
         q, key_cache, value_cache = self.pre_attn(
             hidden_states, selected_freqs, key_cache, value_cache, cache_index
         )
+        _fp8_decode_graph_break(self, q)
         attn_out = self.attn_core(q, key_cache, value_cache, attn_mask)
         return attn_out, key_cache, value_cache
 
@@ -3747,6 +3767,7 @@ class StandardGQABlock(nn.Module):
         q, key_cache, value_cache = self._region_pre_attn(
             hidden_states, selected_freqs, key_cache, value_cache, cache_index
         )
+        _fp8_decode_graph_break(self.self_attn, q)
         h = self._region_attention_tail(
             hidden_states, q, key_cache, value_cache, attn_mask
         )

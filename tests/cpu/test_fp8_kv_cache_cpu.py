@@ -307,8 +307,9 @@ def test_decode_group_blocks_default_and_env(monkeypatch):
             decode_group_blocks(8, 4)
 
 
+@pytest.mark.parametrize("split", [False, True])  # caches whole / sliced per group
 @pytest.mark.parametrize("group", ["1", "2", "3"])
-def test_grouped_decode_matches_one_group(monkeypatch, group):
+def test_grouped_decode_matches_one_group(monkeypatch, group, split):
     """Decode over groups of K blocks (online softmax, uneven last group) gives
     the same output as one group over the whole cache, and tracks fp32."""
     pre, m = 192, 320  # 5 K blocks; decode at positions 192..195 (block 3)
@@ -317,6 +318,8 @@ def test_grouped_decode_matches_one_group(monkeypatch, group):
     for g in ("1000", group):
         monkeypatch.setenv("FP8_KV_DECODE_GROUP", g)
         attn, kc, vc = _state(1, m)
+        # The reference (one group) always reads the caches whole.
+        attn._fp8_split_decode = split and g != "1000"
         store_fp8_kv(
             attn, k[:, :, :pre], v[:, :, :pre], kc, vc, fp8_cache_index(1, m, 0, pre)
         )

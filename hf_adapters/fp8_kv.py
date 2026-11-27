@@ -248,7 +248,7 @@ def allocate_fp8_kv_caches(model, shapes, batch_size, max_cache_len, device):
         for (n_kv, _hd, vhd) in shapes
     ]
 
-    n = attach_fp8_kv(model, shapes, batch_size, device)
+    n = attach_fp8_kv(model, shapes, batch_size, device, n_blocks=n_blocks)
     if n != len(shapes):
         raise RuntimeError(
             f"FP8 KV cache: wired {n} attention module(s) but allocated "
@@ -288,13 +288,15 @@ def _static_scale(attn, name) -> float:
     return value
 
 
-def attach_fp8_kv(model, shapes, batch_size, device) -> int:
+def attach_fp8_kv(model, shapes, batch_size, device, n_blocks=None) -> int:
     """Turn the FP8 KV path on in every attention module, with fresh state.
 
     Sets the layer's static scales (``_fp8_scales`` as floats for Q and the
     score rescale; ``_k_scale`` / ``_v_scale`` as fp16 tensors for the K/V
-    quantize and the V dequantize) and a zeroed K staging block. Returns the
-    number of modules wired up.
+    quantize and the V dequantize), a zeroed K staging block, and
+    ``_fp8_split_decode``: True when decode (B == 1) needs more than one group of
+    K blocks, so the block splits its graph between the store and attention and
+    decode reads the caches per group. Returns the number of modules wired up.
     """
     attns = [
         attn
@@ -312,6 +314,12 @@ def attach_fp8_kv(model, shapes, batch_size, device) -> int:
         attn._v_scale = torch.full((1, 1, 1), v_s, dtype=SCALE_DTYPE).to(device)
         attn._k_staging = torch.zeros(
             (KV_BLOCK, batch_size, n_kv, hd), dtype=STAGING_DTYPE, device=device
+        )
+        g = attn.q_proj.out_features // attn.head_dim // n_kv
+        attn._fp8_split_decode = (
+            batch_size == 1
+            and n_blocks is not None
+            and n_blocks > decode_group_blocks(n_kv, g)
         )
         attn._fp8_store = store_fp8_kv
         attn._fp8_attention = fp8_attention
@@ -533,6 +541,61 @@ def fp8_attention(attn, q, key_cache, value_cache, attn_mask):
     return out.reshape(B, n_q, L, -1)
 
 
+def _group_part(s, v_rows, nb, n_kv):
+    """One group's ``(max, sum, output)`` from its scaled, masked scores ``s``
+    ``[nb, n_kv, g, 64]`` and its fp16 V rows ``[nb*64, n_kv, Dh]``."""
+    m = s.amax(dim=-1, keepdim=True).amax(dim=0, keepdim=True)  # [1, n_kv, g, 1]
+    e = torch.exp(s - m)
+    l_sum = e.sum(dim=-1, keepdim=True).sum(dim=0, keepdim=True)  # [1, n_kv, g, 1]
+    # V viewed as blocks after slicing its rows: a slice of the permuted
+    # [NB, n_kv, 64, Dh] view stops dbo-opt ("unhandled operation").
+    v_blk = v_rows.reshape(nb, KV_BLOCK, n_kv, -1).permute(0, 2, 1, 3)
+    o = torch.matmul(e, v_blk).sum(dim=0, keepdim=True)  # [1, n_kv, g, Dh]
+    return m, l_sum, o
+
+
+def _group_parts_from_cache_slices(q_fp8, kc, vc, mask, v_scale, scale, group):
+    """Every step per group, the caches sliced per group: Q·Kᵀ, mask, softmax
+    pieces, V dequantize and A·V. Only valid when the caches were written in an
+    earlier graph (``_fp8_split_decode``); no tensor spans the whole cache."""
+    _, n_kv, g, Dh = q_fp8.shape
+    n_blocks = kc.shape[0]
+    parts = []
+    for b0 in range(0, n_blocks, group):
+        b1 = min(b0 + group, n_blocks)
+        nb = b1 - b0
+        raw = _scaled_bmm(  # [nb, n_kv, g, 64]
+            q_fp8.expand(nb, n_kv, g, Dh), kc[b0:b1], out_dtype=torch.float16
+        )
+        s = (raw * scale).to(torch.float16)
+        if mask is not None:
+            s = s + mask[b0:b1].clamp(min=MASK_FLOOR)
+        v_rows = _dequantize(vc[b0 * KV_BLOCK : b1 * KV_BLOCK], v_scale)
+        parts.append(_group_part(s, v_rows, nb, n_kv))
+    return parts
+
+
+def _group_parts_from_whole_cache(q_fp8, kc, vc, mask, v_scale, scale, group):
+    """Q·Kᵀ and the V dequantize over the whole caches, read without slicing;
+    only the computed scores and V are split into groups. Correct in the graph
+    that also writes the caches."""
+    _, n_kv, g, Dh = q_fp8.shape
+    n_blocks = kc.shape[0]
+    raw = _scaled_bmm(  # [NB, n_kv, g, 64]
+        q_fp8.expand(n_blocks, n_kv, g, Dh), kc, out_dtype=torch.float16
+    )
+    scores = (raw * scale).to(torch.float16)
+    if mask is not None:
+        scores = scores + mask.clamp(min=MASK_FLOOR)
+    v = _dequantize(vc, v_scale)  # fp16 [M, n_kv, Dh]
+    parts = []
+    for b0 in range(0, n_blocks, group):
+        b1 = min(b0 + group, n_blocks)
+        v_rows = v[b0 * KV_BLOCK : b1 * KV_BLOCK]
+        parts.append(_group_part(scores[b0:b1], v_rows, b1 - b0, n_kv))
+    return parts
+
+
 def _decode_in_groups(attn, q_fp8, key_cache, value_cache, attn_mask, n_q):
     """Decode (B == 1, L == 1) softmax and A·V over groups of K blocks, online softmax.
 
@@ -541,48 +604,39 @@ def _decode_in_groups(attn, q_fp8, key_cache, value_cache, attn_mask, n_q):
     (``block_decode_mask``). Returns ``[1, n_q, 1, Dh]``.
 
     Exactly ``softmax`` over all ``M = NB*64`` positions followed by ``A·V``.
-    Q·Kᵀ runs once over the whole K cache and V is dequantized whole, both read
-    straight from the caches: ``store_fp8_kv`` has just written them in place
-    in this same compiled graph, and on Spyre a view of them (even a
-    full-range slice) reads the pre-store contents, while ``index_select`` on
-    them does not compile. Only computed tensors are split: the scores and the
-    dequantized V are taken ``decode_group_blocks`` blocks at a time, and each
-    group's max and sum (over 64 positions, then its blocks) and ``A·V`` give a
-    running ``(max, sum, output)``, combined as ``m = max m_g``,
-    ``l = sum l_g * exp(m_g - m)``, ``out = sum o_g * exp(m_g - m) / l``. The
-    reductions that hold the scores together never span more than one group
-    (see ``decode_group_blocks``).
+    The K blocks are taken ``decode_group_blocks`` at a time; each group gives
+    a running ``(max, sum, output)`` and the groups are combined as
+    ``m = max m_g``, ``l = sum l_g * exp(m_g - m)``,
+    ``out = sum o_g * exp(m_g - m) / l``, so the reductions that hold the
+    scores together never span more than one group.
+
+    How a group reads the caches depends on ``attn._fp8_split_decode``:
+
+    * True (more than one group): the block ended its graph after the store
+      (``hf_common._fp8_decode_graph_break``), so the caches are inputs this
+      graph does not write, and every step, Q·Kᵀ and the V dequantize
+      included, runs on per-group slices of them. No tensor spans the cache.
+    * False: the store wrote the caches earlier in this same graph, where a
+      slice of them reads the pre-store contents on Spyre (and
+      ``index_select`` on them does not compile). Q·Kᵀ and the V dequantize
+      read the caches whole; only the computed scores and V are split.
 
     Everything stays in the block domain: the scores are never permuted back to
     ``[1, n_q, 1, M]``, which at L == 1 is a view (6D) with no device layout.
     """
     _, n_kv, g, Dh = q_fp8.shape
-    n_blocks = key_cache.shape[0]
     q_s, k_s, _v_s = attn._fp8_scales
     group = decode_group_blocks(n_kv, g)
 
-    raw = _scaled_bmm(  # [NB, n_kv, g, 64]
-        q_fp8.expand(n_blocks, n_kv, g, Dh), key_cache, out_dtype=torch.float16
-    )
-    scores = (raw * (q_s * k_s * attn.scaling)).to(torch.float16)
-    if attn_mask is not None:
-        scores = scores + attn_mask.clamp(min=MASK_FLOOR)
-    v = _dequantize(value_cache, attn._v_scale)  # fp16 [M, n_kv, Dh]
-
-    parts = []
-    for b0 in range(0, n_blocks, group):
-        b1 = min(b0 + group, n_blocks)
-        s = scores[b0:b1]  # [nb, n_kv, g, 64]
-        m = s.amax(dim=-1, keepdim=True).amax(dim=0, keepdim=True)  # [1, n_kv, g, 1]
-        e = torch.exp(s - m)
-        l_sum = e.sum(dim=-1, keepdim=True).sum(dim=0, keepdim=True)  # [1, n_kv, g, 1]
-        # Slice V on its contiguous row dim, then view it as blocks: a slice of
-        # the permuted [NB, n_kv, 64, Dh] view stops dbo-opt ("unhandled
-        # operation" in Sentient/Analyses/Utils.cpp).
-        v_g = v[b0 * KV_BLOCK : b1 * KV_BLOCK]
-        v_blk = v_g.reshape(b1 - b0, KV_BLOCK, n_kv, -1).permute(0, 2, 1, 3)
-        o = torch.matmul(e, v_blk).sum(dim=0, keepdim=True)  # [1, n_kv, g, Dh]
-        parts.append((m, l_sum, o))
+    scale = q_s * k_s * attn.scaling
+    if getattr(attn, "_fp8_split_decode", False):
+        parts = _group_parts_from_cache_slices(
+            q_fp8, key_cache, value_cache, attn_mask, attn._v_scale, scale, group
+        )
+    else:
+        parts = _group_parts_from_whole_cache(
+            q_fp8, key_cache, value_cache, attn_mask, attn._v_scale, scale, group
+        )
 
     m_all = parts[0][0]
     for m_g, _, _ in parts[1:]:
