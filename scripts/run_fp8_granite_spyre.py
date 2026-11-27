@@ -70,6 +70,12 @@ def main() -> int:
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument(
+        "--min-new-tokens",
+        type=int,
+        default=None,
+        help="Suppress EOS until this many tokens are generated (fixed-length timing).",
+    )
+    parser.add_argument(
         "--prompt-tokens",
         type=int,
         default=None,
@@ -103,13 +109,21 @@ def main() -> int:
     print(f"Prompt tokens: {encoded['input_ids'].shape[1]}")
     t0 = time.time()
     sequences = model.generate(
-        **encoded, max_new_tokens=args.max_new_tokens, do_sample=False, timing=True
+        **encoded,
+        max_new_tokens=args.max_new_tokens,
+        min_new_tokens=args.min_new_tokens,
+        do_sample=False,
+        timing=True,
     )
     print(f"Generate time: {time.time() - t0:.1f}s")
 
-    text = tokenizer.decode(
-        sequences[0, encoded["input_ids"].shape[1] :], skip_special_tokens=True
+    new_tokens = sequences[0, encoded["input_ids"].shape[1] :]
+    stopped = new_tokens.numel() < args.max_new_tokens
+    print(
+        f"Generated tokens: {new_tokens.numel()}"
+        + (" (stopped at EOS)" if stopped else "")
     )
+    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
     print(f"Output: {text!r}")
     return 0
 
