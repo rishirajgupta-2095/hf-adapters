@@ -30,6 +30,7 @@ import torch.nn.functional as F
 
 from hf_adapters.fp8_kv import (
     KV_BLOCK,
+    _sliced_reads,
     _static_scale,
     block_decode_mask,
     decode_group_blocks,
@@ -307,13 +308,32 @@ def test_decode_group_blocks_default_and_env(monkeypatch):
             decode_group_blocks(8, 4)
 
 
-@pytest.mark.parametrize("split", [False, True])  # caches whole / sliced per group
+def test_sliced_reads_from_env(monkeypatch):
+    """Split decode slices K, V and the mask unless FP8_KV_DECODE_SLICE narrows it;
+    unsplit decode never slices."""
+    monkeypatch.delenv("FP8_KV_DECODE_SLICE", raising=False)
+    assert _sliced_reads(True) == "kvm"
+    assert _sliced_reads(False) == ""
+    for env, want in (("0", ""), ("1", "kvm"), ("K", "k"), ("vm", "vm")):
+        monkeypatch.setenv("FP8_KV_DECODE_SLICE", env)
+        assert _sliced_reads(True) == want
+        assert _sliced_reads(False) == ""
+    monkeypatch.setenv("FP8_KV_DECODE_SLICE", "kx")
+    with pytest.raises(ValueError):
+        _sliced_reads(True)
+
+
+# split: caches whole / sliced per group; slice: FP8_KV_DECODE_SLICE when split.
+@pytest.mark.parametrize(
+    "split, slice_env", [(False, "1"), (True, "1"), (True, "k"), (True, "vm")]
+)
 @pytest.mark.parametrize("group", ["1", "2", "3"])
-def test_grouped_decode_matches_one_group(monkeypatch, group, split):
+def test_grouped_decode_matches_one_group(monkeypatch, group, split, slice_env):
     """Decode over groups of K blocks (online softmax, uneven last group) gives
     the same output as one group over the whole cache, and tracks fp32."""
     pre, m = 192, 320  # 5 K blocks; decode at positions 192..195 (block 3)
     q, k, v = _qkv(1, pre + 4, seed=21)
+    monkeypatch.setenv("FP8_KV_DECODE_SLICE", slice_env)
     outs = {}
     for g in ("1000", group):
         monkeypatch.setenv("FP8_KV_DECODE_GROUP", g)

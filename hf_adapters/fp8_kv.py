@@ -87,6 +87,8 @@ KV_BLOCK = 64  # positions per K block: the N extent of one QFP8WT stick
 DEFAULT_SCALE = 1.0  # static Q/K/V scale when the checkpoint ships none
 PREFILL_CHUNK_ENV = "FP8_KV_PREFILL_CHUNK"
 DECODE_GROUP_ENV = "FP8_KV_DECODE_GROUP"
+# Debugging: which caches split decode reads per group (see _sliced_reads).
+DECODE_SLICE_ENV = "FP8_KV_DECODE_SLICE"
 # Decode works on groups of K blocks whose score tensor stays this size or
 # smaller (see decode_group_blocks): 1 MiB, under the 1,625,344 B per-core LX
 # budget torch-spyre plans against.
@@ -554,46 +556,70 @@ def _group_part(s, v_rows, nb, n_kv):
     return m, l_sum, o
 
 
-def _group_parts_from_cache_slices(q_fp8, kc, vc, mask, v_scale, scale, group):
-    """Every step per group, the caches sliced per group: Q·Kᵀ, mask, softmax
-    pieces, V dequantize and A·V. Only valid when the caches were written in an
-    earlier graph (``_fp8_split_decode``); no tensor spans the whole cache."""
+def _group_parts(q_fp8, kc, vc, mask, v_scale, scale, group, sliced):
+    """Each group's ``(max, sum, output)``. ``sliced`` holds any of ``"k"``,
+    ``"v"``, ``"m"``: those of the K cache, the V cache and the mask that are
+    read per group through slices ``x[b0:b1]``. The rest are read whole (one
+    Q·Kᵀ over every block, one V dequantize, one mask clamp) and only the
+    computed tensors are split per group.
+
+    Reading the caches whole is correct in the graph that also writes them;
+    slicing them needs the caches written in an earlier graph
+    (``_fp8_split_decode``) and keeps every tensor within one group.
+    """
     _, n_kv, g, Dh = q_fp8.shape
     n_blocks = kc.shape[0]
+    if "k" not in sliced:
+        scores_all = (
+            _scaled_bmm(  # [NB, n_kv, g, 64]
+                q_fp8.expand(n_blocks, n_kv, g, Dh), kc, out_dtype=torch.float16
+            )
+            * scale
+        ).to(torch.float16)
+    if mask is not None and "m" not in sliced:
+        mask_all = mask.clamp(min=MASK_FLOOR)
+    if "v" not in sliced:
+        v_all = _dequantize(vc, v_scale)  # fp16 [M, n_kv, Dh]
     parts = []
     for b0 in range(0, n_blocks, group):
         b1 = min(b0 + group, n_blocks)
         nb = b1 - b0
-        raw = _scaled_bmm(  # [nb, n_kv, g, 64]
-            q_fp8.expand(nb, n_kv, g, Dh), kc[b0:b1], out_dtype=torch.float16
-        )
-        s = (raw * scale).to(torch.float16)
+        if "k" in sliced:
+            raw = _scaled_bmm(  # [nb, n_kv, g, 64]
+                q_fp8.expand(nb, n_kv, g, Dh), kc[b0:b1], out_dtype=torch.float16
+            )
+            s = (raw * scale).to(torch.float16)
+        else:
+            s = scores_all[b0:b1]
         if mask is not None:
-            s = s + mask[b0:b1].clamp(min=MASK_FLOOR)
-        v_rows = _dequantize(vc[b0 * KV_BLOCK : b1 * KV_BLOCK], v_scale)
+            s = s + (
+                mask[b0:b1].clamp(min=MASK_FLOOR) if "m" in sliced else mask_all[b0:b1]
+            )
+        if "v" in sliced:
+            v_rows = _dequantize(vc[b0 * KV_BLOCK : b1 * KV_BLOCK], v_scale)
+        else:
+            v_rows = v_all[b0 * KV_BLOCK : b1 * KV_BLOCK]
         parts.append(_group_part(s, v_rows, nb, n_kv))
     return parts
 
 
-def _group_parts_from_whole_cache(q_fp8, kc, vc, mask, v_scale, scale, group):
-    """Q·Kᵀ and the V dequantize over the whole caches, read without slicing;
-    only the computed scores and V are split into groups. Correct in the graph
-    that also writes the caches."""
-    _, n_kv, g, Dh = q_fp8.shape
-    n_blocks = kc.shape[0]
-    raw = _scaled_bmm(  # [NB, n_kv, g, 64]
-        q_fp8.expand(n_blocks, n_kv, g, Dh), kc, out_dtype=torch.float16
-    )
-    scores = (raw * scale).to(torch.float16)
-    if mask is not None:
-        scores = scores + mask.clamp(min=MASK_FLOOR)
-    v = _dequantize(vc, v_scale)  # fp16 [M, n_kv, Dh]
-    parts = []
-    for b0 in range(0, n_blocks, group):
-        b1 = min(b0 + group, n_blocks)
-        v_rows = v[b0 * KV_BLOCK : b1 * KV_BLOCK]
-        parts.append(_group_part(scores[b0:b1], v_rows, b1 - b0, n_kv))
-    return parts
+def _sliced_reads(split: bool) -> str:
+    """Which of K, V and the mask (``"kvm"``) decode reads per group.
+
+    All three when the graph is split (``split``), none otherwise.
+    ``FP8_KV_DECODE_SLICE`` narrows it for debugging: ``0`` slices nothing,
+    or any of ``k``, ``v``, ``m`` (e.g. ``km``); it only applies when split.
+    """
+    if not split:
+        return ""
+    env = os.environ.get(DECODE_SLICE_ENV, "kvm").strip().lower()
+    if env in ("", "1"):
+        return "kvm"
+    if env == "0":
+        return ""
+    if set(env) - set("kvm"):
+        raise ValueError(f"{DECODE_SLICE_ENV}={env!r}: use 0, 1 or any of k, v, m")
+    return env
 
 
 def _decode_in_groups(attn, q_fp8, key_cache, value_cache, attn_mask, n_q):
@@ -629,17 +655,10 @@ def _decode_in_groups(attn, q_fp8, key_cache, value_cache, attn_mask, n_q):
     group = decode_group_blocks(n_kv, g)
 
     scale = q_s * k_s * attn.scaling
-    # FP8_KV_DECODE_SLICE=0 keeps the split graph but reads the caches whole
-    # (a debugging switch: separates the graph split from the sliced reads).
-    slice_ok = os.environ.get("FP8_KV_DECODE_SLICE", "1") != "0"
-    if getattr(attn, "_fp8_split_decode", False) and slice_ok:
-        parts = _group_parts_from_cache_slices(
-            q_fp8, key_cache, value_cache, attn_mask, attn._v_scale, scale, group
-        )
-    else:
-        parts = _group_parts_from_whole_cache(
-            q_fp8, key_cache, value_cache, attn_mask, attn._v_scale, scale, group
-        )
+    sliced = _sliced_reads(getattr(attn, "_fp8_split_decode", False))
+    parts = _group_parts(
+        q_fp8, key_cache, value_cache, attn_mask, attn._v_scale, scale, group, sliced
+    )
 
     m_all = parts[0][0]
     for m_g, _, _ in parts[1:]:
