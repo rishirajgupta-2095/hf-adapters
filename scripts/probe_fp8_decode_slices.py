@@ -27,6 +27,12 @@ def main():
     p.add_argument("--device", default="spyre")
     p.add_argument("--cache-len", type=int, default=2560)  # 40 K blocks
     p.add_argument("--group", type=int, default=16)  # groups at 0, 16, 32
+    p.add_argument(
+        "--no-decode-store",
+        dest="decode_store",
+        action="store_false",
+        help="skip the one-token decode store before attention",
+    )
     a = p.parse_args()
     dev, m_len, grp = a.device, a.cache_len, a.group
     nb_all = m_len // BLK
@@ -53,9 +59,18 @@ def main():
     )
     compile_(store)(k, v, kc, vc, i0, i1, i2)
 
+    # Decode-style store, as the model does each step: one token into the
+    # staging slot, its whole K block requantized and rewritten, one V row.
+    pos = m_len - 2 * BLK  # first slot of the second-to-last block
+    k1 = (torch.randn(1, NKV, 1, DH) * 0.5).half().contiguous().to(dev)
+    v1 = (torch.randn(1, NKV, 1, DH) * 0.5).half().contiguous().to(dev)
+    d0, d1, d2 = F.fp8_cache_index(1, m_len, pos, 1, device=dev)
+    if a.decode_store:
+        compile_(store)(k1, v1, kc, vc, d0, d1, d2)
+
     q = torch.randn(1, NKV * G, 1, DH).half().contiguous().to(dev)
     mask_host = torch.zeros(1, 1, 1, m_len, dtype=torch.float16)
-    mask_host[..., m_len - 37 :] = float("-inf")  # some masked positions
+    mask_host[..., pos + 1 :] = float("-inf")  # decode at pos: later positions masked
     mask = F.block_decode_mask(mask_host).to(dev)
 
     def make(slice_k, slice_v, slice_m):
@@ -98,7 +113,10 @@ def main():
         return compile_(f)
 
     ref = make(False, False, False)(q, kc, vc, mask).cpu().float()
-    print(f"cache {m_len} ({nb_all} K blocks), groups of {grp}, device {dev}")
+    print(
+        f"cache {m_len} ({nb_all} K blocks), groups of {grp}, device {dev}, "
+        f"decode store at {pos}: {a.decode_store}"
+    )
     for name, flags in [
         ("K sliced", (True, False, False)),
         ("V sliced", (False, True, False)),

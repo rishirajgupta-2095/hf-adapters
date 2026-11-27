@@ -629,7 +629,10 @@ def _decode_in_groups(attn, q_fp8, key_cache, value_cache, attn_mask, n_q):
     group = decode_group_blocks(n_kv, g)
 
     scale = q_s * k_s * attn.scaling
-    if getattr(attn, "_fp8_split_decode", False):
+    # FP8_KV_DECODE_SLICE=0 keeps the split graph but reads the caches whole
+    # (a debugging switch: separates the graph split from the sliced reads).
+    slice_ok = os.environ.get("FP8_KV_DECODE_SLICE", "1") != "0"
+    if getattr(attn, "_fp8_split_decode", False) and slice_ok:
         parts = _group_parts_from_cache_slices(
             q_fp8, key_cache, value_cache, attn_mask, attn._v_scale, scale, group
         )
