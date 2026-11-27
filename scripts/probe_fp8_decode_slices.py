@@ -28,6 +28,11 @@ def main():
     p.add_argument("--cache-len", type=int, default=2560)  # 40 K blocks
     p.add_argument("--group", type=int, default=16)  # groups at 0, 16, 32
     p.add_argument(
+        "--scores",
+        action="store_true",
+        help="compare raw Q·Kᵀ per block (sliced K vs whole K) instead of outputs",
+    )
+    p.add_argument(
         "--no-decode-store",
         dest="decode_store",
         action="store_false",
@@ -112,6 +117,9 @@ def main():
 
         return compile_(f)
 
+    if a.scores:
+        return compare_k_scores(q, kc, nb_all, grp, compile_)
+
     ref = make(False, False, False)(q, kc, vc, mask).cpu().float()
     print(
         f"cache {m_len} ({nb_all} K blocks), groups of {grp}, device {dev}, "
@@ -128,6 +136,47 @@ def main():
         diff = (out - ref).abs().max().item()
         print(
             f"{name:12s} cos vs whole-cache path: {cos.item():.6f}   max abs diff {diff:.4f}"
+        )
+
+
+def compare_k_scores(q, kc, nb_all, grp, compile_):
+    """Raw Q·Kᵀ per K block, from ``kc[b0:b1]`` per group vs one product over the
+    whole cache. Outputs hide score errors (random data gives a flat softmax),
+    so compare the scores themselves; for a wrong block, name the whole-cache
+    block it matches instead."""
+
+    def f(q, kc):
+        q_fp8 = F._quantize_q(q.reshape(1, NKV, G, DH), 1.0)
+        whole = F._scaled_bmm(
+            q_fp8.expand(nb_all, NKV, G, DH), kc, out_dtype=torch.float16
+        )
+        groups = [
+            F._scaled_bmm(
+                q_fp8.expand(min(b0 + grp, nb_all) - b0, NKV, G, DH),
+                kc[b0 : min(b0 + grp, nb_all)],
+                out_dtype=torch.float16,
+            )
+            for b0 in range(0, nb_all, grp)
+        ]
+        return whole, *groups
+
+    whole, *groups = (t.cpu().float() for t in compile_(f)(q, kc))
+    flat = whole.reshape(nb_all, -1)
+    print(f"raw Q·Kᵀ per block, {nb_all} K blocks in groups of {grp}")
+    for gi, raw in enumerate(groups):
+        b0 = gi * grp
+        bad = []
+        for j in range(raw.shape[0]):
+            x = raw[j].reshape(-1)
+            if torch.allclose(x, flat[b0 + j], rtol=1e-2, atol=1e-2):
+                continue
+            cos = torch.nn.functional.cosine_similarity(flat, x[None], dim=1)
+            best = int(cos.argmax())
+            bad.append(f"{b0 + j}->{best}({cos[best].item():.3f})")
+        n = raw.shape[0]
+        print(
+            f"group {gi} blocks {b0}..{b0 + n - 1}: {n - len(bad)}/{n} match"
+            + (f"; sliced block -> best whole block: {' '.join(bad)}" if bad else "")
         )
 
 
