@@ -28,6 +28,12 @@ def main():
     p.add_argument("--cache-len", type=int, default=2560)  # 40 K blocks
     p.add_argument("--group", type=int, default=16)  # groups at 0, 16, 32
     p.add_argument(
+        "--kv-block",
+        type=int,
+        default=F.KV_BLOCK,
+        help="positions per K block (sets fp8_kv.KV_BLOCK); 128 fills a stick",
+    )
+    p.add_argument(
         "--scores",
         action="store_true",
         help="compare raw Q·Kᵀ per block (sliced K vs whole K) instead of outputs",
@@ -39,7 +45,11 @@ def main():
         help="skip the one-token decode store before attention",
     )
     a = p.parse_args()
+    global BLK
+    BLK = F.KV_BLOCK = a.kv_block  # read at call time by every fp8_kv helper
     dev, m_len, grp = a.device, a.cache_len, a.group
+    if m_len % BLK:
+        p.error(f"--cache-len {m_len} is not a multiple of --kv-block {BLK}")
     nb_all = m_len // BLK
     torch.manual_seed(0)
 
@@ -162,7 +172,10 @@ def compare_k_scores(q, kc, nb_all, grp, compile_):
 
     whole, *groups = (t.cpu().float() for t in compile_(f)(q, kc))
     flat = whole.reshape(nb_all, -1)
-    print(f"raw Q·Kᵀ per block, {nb_all} K blocks in groups of {grp}")
+    print(
+        f"raw Q·Kᵀ per block, {nb_all} K blocks of {BLK} positions in groups "
+        f"of {grp}, K cache {tuple(kc.shape)}"
+    )
     for gi, raw in enumerate(groups):
         b0 = gi * grp
         bad = []
