@@ -77,11 +77,14 @@ attention modules instead.
 from __future__ import annotations
 
 import functools
+import logging
 import os
 
 import torch
 
 from .fp8_linear import FP8_DTYPE, FP8_MAX
+
+logger = logging.getLogger(__name__)
 
 KV_BLOCK = 64  # positions per K block: the N extent of one QFP8WT stick
 DEFAULT_SCALE = 1.0  # static Q/K/V scale when the checkpoint ships none
@@ -89,6 +92,8 @@ PREFILL_CHUNK_ENV = "FP8_KV_PREFILL_CHUNK"
 DECODE_GROUP_ENV = "FP8_KV_DECODE_GROUP"
 # Debugging: which caches split decode reads per group (see _sliced_reads).
 DECODE_SLICE_ENV = "FP8_KV_DECODE_SLICE"
+# Override for the measured K slice offset factor (see k_slice_factor).
+K_SLICE_FACTOR_ENV = "FP8_KV_K_SLICE_FACTOR"
 # Decode works on groups of K blocks whose score tensor stays this size or
 # smaller (see decode_group_blocks): 1 MiB, under the 1,625,344 B per-core LX
 # budget torch-spyre plans against.
@@ -228,6 +233,93 @@ def _allocate_v_cache(n_rows, n_kv, head_dim, device):
     return cache
 
 
+# ---------------------------------------------------------------------------
+# K cache slice offset (workaround)
+# ---------------------------------------------------------------------------
+
+_K_SLICE_CHECK_BLOCKS = 8
+_K_SLICE_CHECK_START = 2
+_k_slice_factors: dict = {}
+
+
+def k_slice_factor(n_kv: int, g: int, head_dim: int, device) -> int | None:
+    """Where a slice ``kc[b0:b1]`` of the K cache really starts: block
+    ``factor * b0``. 1 is correct; None means neither 1 nor 2.
+
+    On Spyre (torch-spyre ``fp8-kv-5178-on-loop-tile``, 2026-11), a slice of a
+    QFP8WT tensor along its block dim starts at twice its offset: ``kc[16:32]``
+    reads blocks 32..47, for 64- and 128-position blocks alike, whether
+    ``scaled_bmm`` or a copy reads it (``scripts/probe_fp8_decode_slices.py
+    --scores --k-read``). The QFP8WT stick is 2D, ``[2, 64]``; an offset counted
+    in its inner 64 rather than all 128 elements would be doubled. V
+    (ordinary QFP8CH rows) slices correctly.
+
+    Measured once per process and shape on a small K cache, so decode slices
+    at ``b0 // factor`` today and at ``b0`` once torch-spyre is fixed. CPU: 1.
+    ``$FP8_KV_K_SLICE_FACTOR`` (``1`` or ``2``) skips the measurement.
+    """
+    raw = os.environ.get(K_SLICE_FACTOR_ENV, "").strip().lower()
+    if raw not in ("", "auto"):
+        if raw not in ("1", "2"):
+            raise ValueError(f"{K_SLICE_FACTOR_ENV}={raw!r}: use auto, 1 or 2")
+        return int(raw)
+    if torch.device(device).type != "spyre":
+        return 1
+    key = (n_kv, g, head_dim, str(device))
+    if key not in _k_slice_factors:
+        _k_slice_factors[key] = _measure_k_slice_factor(n_kv, g, head_dim, device)
+    return _k_slice_factors[key]
+
+
+def _k_slice_check(q, kc):
+    """Raw Q·Kᵀ over the whole K cache, and over the slice ``kc[b0:b0 + 2]``."""
+    nb = kc.shape[0]
+    _, n_kv, g, dh = q.shape
+    b0 = _K_SLICE_CHECK_START
+    q_fp8 = _quantize_q(q, 1.0)
+    whole = _scaled_bmm(q_fp8.expand(nb, n_kv, g, dh), kc, out_dtype=torch.float16)
+    part = _scaled_bmm(
+        q_fp8.expand(2, n_kv, g, dh), kc[b0 : b0 + 2], out_dtype=torch.float16
+    )
+    return whole, part
+
+
+def _measure_k_slice_factor(n_kv, g, head_dim, device) -> int | None:
+    """Fill block ``b`` of a small K cache with ``(b + 1) / 4`` (exact in E4M3),
+    score it with a Q of ones, and see which blocks the slice
+    ``kc[2:4]`` returned."""
+    nb, b0 = _K_SLICE_CHECK_BLOCKS, _K_SLICE_CHECK_START
+    vals = (torch.arange(nb, dtype=torch.float16) + 1) / 4
+    fill = vals.view(nb, 1, 1, 1).expand(nb, n_kv, head_dim, KV_BLOCK).contiguous()
+    global _qfp8wt_zeros_compiled
+    if _qfp8wt_zeros_compiled is None:
+        _qfp8wt_zeros_compiled = torch.compile(_qfp8wt_zeros, dynamic=False)
+    scale = torch.ones((1, 1, 1, 1), dtype=SCALE_DTYPE).to(device)
+    kc = _qfp8wt_zeros_compiled(fill.to(device), scale)
+    q = torch.ones((1, n_kv, g, head_dim), dtype=torch.float16).to(device)
+    whole, part = torch.compile(_k_slice_check, dynamic=False)(q, kc)
+    w = whole.cpu().float().mean(dim=(1, 2, 3))
+    got = part.cpu().float().mean(dim=(1, 2, 3))
+    for factor in (1, 2):
+        start = factor * b0
+        if torch.allclose(got, w[start : start + 2], rtol=1e-3, atol=1e-3):
+            if factor != 1:
+                logger.warning(
+                    "FP8 KV cache: K cache slices start at %dx their offset on "
+                    "this torch-spyre; decode slices K at b0 // %d",
+                    factor,
+                    factor,
+                )
+            return factor
+    logger.warning(
+        "FP8 KV cache: a K cache slice read neither its blocks nor twice its "
+        "offset (block means %s, slice %s); decode reads K whole",
+        w.tolist(),
+        got.tolist(),
+    )
+    return None
+
+
 def allocate_fp8_kv_caches(model, shapes, batch_size, max_cache_len, device):
     """E4M3 key (QFP8WT blocks) and value (QFP8CH rows) caches, plus scales.
 
@@ -322,6 +414,10 @@ def attach_fp8_kv(model, shapes, batch_size, device, n_blocks=None) -> int:
             batch_size == 1
             and n_blocks is not None
             and n_blocks > decode_group_blocks(n_kv, g)
+        )
+        # Only split decode slices K; see k_slice_factor.
+        attn._k_slice_factor = (
+            k_slice_factor(n_kv, g, hd, device) if attn._fp8_split_decode else 1
         )
         attn._fp8_store = store_fp8_kv
         attn._fp8_attention = fp8_attention
@@ -556,7 +652,7 @@ def _group_part(s, v_rows, nb, n_kv):
     return m, l_sum, o
 
 
-def _group_parts(q_fp8, kc, vc, mask, v_scale, scale, group, sliced):
+def _group_parts(q_fp8, kc, vc, mask, v_scale, scale, group, sliced, k_factor=1):
     """Each group's ``(max, sum, output)``. ``sliced`` holds any of ``"k"``,
     ``"v"``, ``"m"``: those of the K cache, the V cache and the mask that are
     read per group through slices ``x[b0:b1]``. The rest are read whole (one
@@ -566,6 +662,9 @@ def _group_parts(q_fp8, kc, vc, mask, v_scale, scale, group, sliced):
     Reading the caches whole is correct in the graph that also writes them;
     slicing them needs the caches written in an earlier graph
     (``_fp8_split_decode``) and keeps every tensor within one group.
+
+    ``k_factor`` (``k_slice_factor``): K group ``[b0, b1)`` is sliced at
+    ``b0 // k_factor``, where the device actually finds block ``b0``.
     """
     _, n_kv, g, Dh = q_fp8.shape
     n_blocks = kc.shape[0]
@@ -585,8 +684,9 @@ def _group_parts(q_fp8, kc, vc, mask, v_scale, scale, group, sliced):
         b1 = min(b0 + group, n_blocks)
         nb = b1 - b0
         if "k" in sliced:
+            k0 = b0 // k_factor
             raw = _scaled_bmm(  # [nb, n_kv, g, 64]
-                q_fp8.expand(nb, n_kv, g, Dh), kc[b0:b1], out_dtype=torch.float16
+                q_fp8.expand(nb, n_kv, g, Dh), kc[k0 : k0 + nb], out_dtype=torch.float16
             )
             s = (raw * scale).to(torch.float16)
         else:
@@ -656,8 +756,21 @@ def _decode_in_groups(attn, q_fp8, key_cache, value_cache, attn_mask, n_q):
 
     scale = q_s * k_s * attn.scaling
     sliced = _sliced_reads(getattr(attn, "_fp8_split_decode", False))
+    # K slices start at k_factor x their offset on device (k_slice_factor):
+    # compensated when every group start divides by it, else K is read whole.
+    k_factor = getattr(attn, "_k_slice_factor", 1)
+    if "k" in sliced and (k_factor is None or group % k_factor):
+        sliced = sliced.replace("k", "")
     parts = _group_parts(
-        q_fp8, key_cache, value_cache, attn_mask, attn._v_scale, scale, group, sliced
+        q_fp8,
+        key_cache,
+        value_cache,
+        attn_mask,
+        attn._v_scale,
+        scale,
+        group,
+        sliced,
+        k_factor or 1,
     )
 
     m_all = parts[0][0]

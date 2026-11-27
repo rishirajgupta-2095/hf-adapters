@@ -3624,6 +3624,9 @@ class StandardGQAAttention(nn.Module):
         # group; it needs the store and the attention in separate graphs
         # (see _fp8_decode_graph_break).
         self._fp8_split_decode = False
+        # Where a K cache slice really starts, in multiples of its offset
+        # (fp8_kv.k_slice_factor; None: K is read whole).
+        self._k_slice_factor = 1
         self._k_scale = None
         self._v_scale = None
 

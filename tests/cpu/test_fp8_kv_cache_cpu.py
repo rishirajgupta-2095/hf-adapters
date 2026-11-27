@@ -37,6 +37,7 @@ from hf_adapters.fp8_kv import (
     fp8_attention,
     fp8_cache_index,
     fp8_qk_attention,
+    k_slice_factor,
     prefill_chunk_size,
     store_fp8_kv,
 )
@@ -306,6 +307,50 @@ def test_decode_group_blocks_default_and_env(monkeypatch):
         monkeypatch.setenv("FP8_KV_DECODE_GROUP", bad)
         with pytest.raises(ValueError):
             decode_group_blocks(8, 4)
+
+
+def test_k_slice_factor(monkeypatch):
+    """CPU slices are right (1); FP8_KV_K_SLICE_FACTOR overrides; bad values fail."""
+    monkeypatch.delenv("FP8_KV_K_SLICE_FACTOR", raising=False)
+    assert k_slice_factor(8, 4, 128, "cpu") == 1
+    for env, want in (("auto", 1), ("1", 1), ("2", 2)):
+        monkeypatch.setenv("FP8_KV_K_SLICE_FACTOR", env)
+        assert k_slice_factor(8, 4, 128, "cpu") == want
+    monkeypatch.setenv("FP8_KV_K_SLICE_FACTOR", "3")
+    with pytest.raises(ValueError):
+        k_slice_factor(8, 4, 128, "cpu")
+
+
+@pytest.mark.parametrize("k_factor", [None, 2])
+def test_grouped_decode_reads_k_whole_when_slices_cannot_be_fixed(
+    monkeypatch, k_factor
+):
+    """Split decode falls back to reading K whole when K slices are off by an
+    unknown factor (None) or by one an odd group start cannot be divided by
+    (2, groups of 3), and still matches one group over the whole cache."""
+    pre, m = 192, 320  # 5 K blocks; decode at positions 192..195
+    q, k, v = _qkv(1, pre + 4, seed=23)
+    monkeypatch.delenv("FP8_KV_DECODE_SLICE", raising=False)
+    outs = {}
+    for g in ("1000", "3"):
+        monkeypatch.setenv("FP8_KV_DECODE_GROUP", g)
+        attn, kc, vc = _state(1, m)
+        attn._fp8_split_decode = g != "1000"
+        attn._k_slice_factor = k_factor
+        store_fp8_kv(
+            attn, k[:, :, :pre], v[:, :, :pre], kc, vc, fp8_cache_index(1, m, 0, pre)
+        )
+        got = []
+        for pos in range(pre, pre + 4):
+            sl = slice(pos, pos + 1)
+            store_fp8_kv(
+                attn, k[:, :, sl], v[:, :, sl], kc, vc, fp8_cache_index(1, m, pos, 1)
+            )
+            mask = block_decode_mask(_mask(pos, 1, m))
+            got.append(fp8_attention(attn, q[:, :, sl], kc, vc, mask))
+        outs[g] = got
+    for one, grouped in zip(outs["1000"], outs["3"]):
+        torch.testing.assert_close(grouped.float(), one.float(), rtol=2e-3, atol=2e-3)
 
 
 def test_sliced_reads_from_env(monkeypatch):
